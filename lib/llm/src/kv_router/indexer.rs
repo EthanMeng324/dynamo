@@ -41,7 +41,7 @@ use prometheus::{IntCounterVec, Opts};
 use serde::{Deserialize, Serialize};
 use std::{
     cell::RefCell,
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, VecDeque},
     iter,
     rc::Rc,
     sync::{Arc, Mutex, OnceLock},
@@ -160,15 +160,25 @@ impl MaybeError for WorkerKvQueryResponse {
     }
 }
 
+/// Information about a worker's block in the radix tree.
+#[derive(Debug, Clone)]
+pub(crate) struct WorkerBlockInfo {
+    /// External hash for the GPU-resident copy of this block (if present).
+    gpu_block_hash: Option<ExternalSequenceBlockHash>,
+    /// External hash for the CPU-resident copy of this block (if present).
+    cpu_block_hash: Option<ExternalSequenceBlockHash>,
+}
+
 /// A block in the Radix Tree.
 #[derive(Debug)]
 struct RadixBlock {
     /// A map of child blocks, keyed by their local block hash.
     children: HashMap<LocalBlockHash, SharedRadixBlock>,
-    /// The set of workers that have this block cached.
-    workers: HashSet<WorkerWithDpRank>,
+    /// A map of workers (with dp_rank) to their block information.
+    /// The external hash is preserved to speed up snapshotting.
+    workers: HashMap<WorkerWithDpRank, WorkerBlockInfo>,
     /// The external sequence block hash for this block (None for root).
-    /// This is the same for all workers under the simplifying assumption.
+    /// This is used as the canonical block hash for traversal and dump order.
     block_hash: Option<ExternalSequenceBlockHash>,
     /// A buffer of times that this block was last traversed
     recent_uses: VecDeque<Instant>,
@@ -183,7 +193,7 @@ impl RadixBlock {
     pub fn new() -> Self {
         Self {
             children: HashMap::new(),
-            workers: HashSet::new(),
+            workers: HashMap::new(),
             block_hash: None,
             recent_uses: VecDeque::new(),
         }
@@ -197,7 +207,7 @@ impl RadixBlock {
     pub fn with_hash(block_hash: ExternalSequenceBlockHash) -> Self {
         Self {
             children: HashMap::new(),
-            workers: HashSet::new(),
+            workers: HashMap::new(),
             block_hash: Some(block_hash),
             recent_uses: VecDeque::new(),
         }
@@ -300,7 +310,10 @@ impl RadixTree {
                 current_borrow.children.get(block_hash).cloned()
             };
             if let Some(block) = next_block {
-                scores.update_scores(block.borrow().workers.iter());
+                {
+                    let block_borrow = block.borrow();
+                    scores.update_scores(block_borrow.workers.iter());
+                } // block_borrow is dropped here
 
                 if let Some(expiration_duration) = self.expiration_duration {
                     let mut block_mut = block.borrow_mut();
@@ -314,11 +327,14 @@ impl RadixTree {
                     }
                     scores.add_frequency(block_mut.recent_uses.len());
                     block_mut.recent_uses.push_back(now);
-                }
+                } // block_mut is dropped here
 
-                if early_exit && block.borrow().workers.len() == 1 {
-                    break;
-                }
+                {
+                    let block_borrow = block.borrow();
+                    if early_exit && block_borrow.workers.len() == 1 {
+                        break;
+                    }
+                } // block_borrow is dropped here
 
                 current = block;
             } else {
@@ -331,16 +347,20 @@ impl RadixTree {
             }
         }
 
-        tracing::trace!("RadixTree::find_matches: final scores={:?}", scores.scores);
+        tracing::info!("RadixTree::find_matches: final GPU scores={:?}, CPU scores={:?}", scores.gpu_scores, scores.cpu_scores);
 
-        // Populate tree sizes for all workers that have scores
-        for worker in scores.scores.keys() {
+        // Populate tree sizes for all workers that have scores (from either GPU or CPU)
+        let all_workers: Vec<_> = scores.gpu_scores.keys()
+            .chain(scores.cpu_scores.keys())
+            .copied()
+            .collect();
+        for worker in all_workers {
             let tree_size = self
                 .lookup
-                .get(worker)
+                .get(&worker)
                 .expect("worker in scores must exist in lookup table")
                 .len();
-            scores.tree_sizes.insert(*worker, tree_size);
+            scores.tree_sizes.insert(worker, tree_size);
         }
 
         scores
@@ -435,8 +455,27 @@ impl RadixTree {
                             }
                         };
 
-                        // add our worker to the block
-                        child_mut.workers.insert(worker);
+                        // add/update our worker's info for this block, tracking both GPU and CPU presence.
+                        let is_gpu = block_data
+                            .medium
+                            .as_deref()
+                            .map(|m| m.eq_ignore_ascii_case("GPU"))
+                            .unwrap_or(false);
+
+                        child_mut
+                            .workers
+                            .entry(worker)
+                            .and_modify(|info| {
+                                if is_gpu {
+                                    info.gpu_block_hash = Some(block_data.block_hash);
+                                } else {
+                                    info.cpu_block_hash = Some(block_data.block_hash);
+                                }
+                            })
+                            .or_insert_with(|| WorkerBlockInfo {
+                                gpu_block_hash: is_gpu.then_some(block_data.block_hash),
+                                cpu_block_hash: (!is_gpu).then_some(block_data.block_hash),
+                            });
                     }
 
                     // add the block to the worker's lookup table
@@ -474,7 +513,21 @@ impl RadixTree {
                     };
 
                     let mut guard = entry.borrow_mut();
-                    guard.workers.remove(&worker);
+                    if let Some(info) = guard.workers.get_mut(&worker) {
+                        // Clear the tier that matches this external block hash.
+                        if info.gpu_block_hash == Some(block) {
+                            info.gpu_block_hash = None;
+                        }
+                        if info.cpu_block_hash == Some(block) {
+                            info.cpu_block_hash = None;
+                        }
+
+                        // Remove worker entry only if no tiers remain for this worker on this block.
+                        if info.gpu_block_hash.is_none() && info.cpu_block_hash.is_none() {
+                            guard.workers.remove(&worker);
+                        }
+                    }
+
                     if guard.workers.is_empty() {
                         // if no workers are using this block, that is true for all children
                         guard.children.clear();
@@ -568,26 +621,34 @@ impl RadixTree {
                 .block_hash
                 .expect("non-root block must have block_hash");
 
-            // For each worker that has this block
-            for worker in &current_borrow.workers {
-                // Create a store event for this worker
-                let event = RouterEvent {
-                    worker_id: worker.worker_id,
-                    event: KvCacheEvent {
-                        event_id,
-                        data: KvCacheEventData::Stored(KvCacheStoreData {
-                            parent_hash,
-                            blocks: vec![KvCacheStoredBlockData {
-                                block_hash,
-                                mm_extra_info: None,
-                                tokens_hash,
-                            }],
-                        }),
-                        dp_rank: worker.dp_rank,
-                    },
-                };
-                events.push(event);
-                event_id += 1;
+            // For each worker that has this block, emit one event per present medium tier.
+            for (worker_id, block_info) in &current_borrow.workers {
+                // Emit one store event per tier we know about (GPU + CPU).
+                for (tier_hash, tier_medium) in [
+                    (block_info.gpu_block_hash, Some("GPU".to_string())),
+                    (block_info.cpu_block_hash, Some("CPU".to_string())),
+                ] {
+                    let Some(block_hash) = tier_hash else { continue };
+
+                    let event = RouterEvent {
+                        worker_id: worker_id.worker_id,
+                        event: KvCacheEvent {
+                            event_id,
+                            data: KvCacheEventData::Stored(KvCacheStoreData {
+                                parent_hash,
+                                blocks: vec![KvCacheStoredBlockData {
+                                    block_hash,
+                                    mm_extra_info: None,
+                                    tokens_hash,
+                                    medium: tier_medium.clone(),
+                                }],
+                            }),
+                            dp_rank: worker_id.dp_rank,
+                        },
+                    };
+                    events.push(event);
+                    event_id += 1;
+                }
             }
 
             // Enqueue children with this block's hash as their parent
@@ -701,12 +762,17 @@ impl KvIndexerMetrics {
 /// Scores representing the overlap of workers (with their dp_rank).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OverlapScores {
-    // map of worker (with dp_rank) to score
-    pub scores: HashMap<WorkerWithDpRank, u32>,
+    // map of worker (with dp_rank) to GPU match count
+    pub gpu_scores: HashMap<WorkerWithDpRank, u32>,
+    // map of worker (with dp_rank) to CPU match count
+    pub cpu_scores: HashMap<WorkerWithDpRank, u32>,
     // List of frequencies that the blocks have been accessed. Entries with value 0 are omitted.
     pub frequencies: Vec<usize>,
     // Map of worker to their tree size (number of blocks in the tree for that worker)
     pub tree_sizes: HashMap<WorkerWithDpRank, usize>,
+    // Legacy field for backward compatibility (total score = GPU + CPU)
+    #[serde(default)]
+    pub scores: HashMap<WorkerWithDpRank, u32>,
 }
 
 impl Default for OverlapScores {
@@ -723,24 +789,39 @@ impl OverlapScores {
     /// A new `OverlapScores`.
     pub fn new() -> Self {
         Self {
-            scores: HashMap::new(),
+            gpu_scores: HashMap::new(),
+            cpu_scores: HashMap::new(),
             frequencies: Vec::with_capacity(32),
             tree_sizes: HashMap::new(),
+            scores: HashMap::new(),
         }
     }
 
-    /// Update the scores with a set of workers.
+    /// Update the scores with worker block information.
     ///
     /// ### Arguments
     ///
-    /// * `workers` - An iterator over `WorkerWithDpRank` references.
-    pub fn update_scores<'a, I>(&mut self, workers: I)
+    /// * `worker_blocks` - An iterator over `(&WorkerWithDpRank, &WorkerBlockInfo)` tuples.
+    pub(crate) fn update_scores<'a, I>(&mut self, worker_blocks: I)
     where
-        I: IntoIterator<Item = &'a WorkerWithDpRank>,
+        I: IntoIterator<Item = (&'a WorkerWithDpRank, &'a WorkerBlockInfo)>,
     {
-        for worker in workers {
-            let score = self.scores.entry(*worker).or_insert(0);
-            *score += 1;
+        for (worker, block_info) in worker_blocks {
+            // Prefer GPU when both tiers exist. Count CPU only when GPU is absent.
+            if block_info.gpu_block_hash.is_some() {
+                let score = self.gpu_scores.entry(*worker).or_insert(0);
+                *score += 1;
+            } else if block_info.cpu_block_hash.is_some() {
+                let score = self.cpu_scores.entry(*worker).or_insert(0);
+                *score += 1;
+            } else {
+                // Should not happen; ignore.
+                continue;
+            }
+            
+            // Update legacy total score for backward compatibility
+            let total_score = self.scores.entry(*worker).or_insert(0);
+            *total_score += 1;
         }
     }
 
@@ -1031,7 +1112,8 @@ impl KvIndexer {
                                 blocks: hashes.map(|(local_hash, sequence_hash)| KvCacheStoredBlockData {
                                     tokens_hash: *local_hash,
                                     block_hash: ExternalSequenceBlockHash(*sequence_hash),
-                                mm_extra_info: None,
+                                    mm_extra_info: None,
+                                    medium: None,
                                 }).collect(),
                             });
 
@@ -1757,7 +1839,8 @@ impl KvIndexerSharded {
                                     blocks: hashes.map(|(local_hash, sequence_hash)| KvCacheStoredBlockData {
                                         tokens_hash: *local_hash,
                                         block_hash: ExternalSequenceBlockHash(*sequence_hash),
-                                mm_extra_info: None,
+                                        mm_extra_info: None,
+                                        medium: None,
                                     }).collect(),
                                 });
 
@@ -2055,6 +2138,7 @@ mod tests {
                 tokens_hash: LocalBlockHash(*i),
                 block_hash: ExternalSequenceBlockHash(*i * 100),
                 mm_extra_info: None,
+                medium: None,
             })
             .collect()
     }
@@ -2866,6 +2950,7 @@ mod tests {
                     block_hash: ExternalSequenceBlockHash(0),
                     mm_extra_info: None,
                     tokens_hash: LocalBlockHash(13226331709069118873),
+                    medium: None,
                 }],
             }),
             dp_rank: 0,
@@ -3329,6 +3414,7 @@ mod tests {
                             block_hash: ExternalSequenceBlockHash(id * 100),
                             tokens_hash: LocalBlockHash(id * 200),
                             mm_extra_info: None,
+                            medium: None,
                         }],
                     }),
                     dp_rank: 0,
@@ -3505,6 +3591,7 @@ mod tests {
                         block_hash: ExternalSequenceBlockHash(100),
                         tokens_hash: LocalBlockHash(200),
                         mm_extra_info: None,
+                        medium: None,
                     }],
                 }),
                 dp_rank: 0,

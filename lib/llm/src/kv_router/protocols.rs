@@ -406,6 +406,9 @@ pub struct KvCacheStoredBlockData {
     /// because bincode is positional and expects all fields to be present.
     #[serde(default)]
     pub mm_extra_info: Option<BlockExtraInfo>,
+    /// The storage medium for this block (e.g., "GPU", "CPU_TIER1", "CPU_TIER2")
+    #[serde(default)]
+    pub medium: Option<String>,
 }
 
 /// Represents the data associated with a removed cache event.

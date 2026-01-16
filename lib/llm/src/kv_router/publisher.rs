@@ -505,7 +505,7 @@ pub async fn start_zmq_listener(
                     continue;
                 };
 
-                tracing::trace!(
+                tracing::info!(
                     "ZMQ listener on {} received batch with {} events (seq={}, dp_rank={})",
                     zmq_endpoint,
                     batch.events.len(),
@@ -515,6 +515,9 @@ pub async fn start_zmq_listener(
 
                 let dp_rank = batch.data_parallel_rank.unwrap_or(0) as u32;
                 for raw_event in batch.events.into_iter() {
+                    tracing::info!(
+                        "ZMQ listener: Processing raw event, checking medium field..."
+                    );
                     let event = convert_event(raw_event, seq, kv_block_size, dp_rank, &warning_count);
                     if tx.send(event).is_err() {
                         tracing::warn!("Failed to send message to channel - receiver dropped");
@@ -550,8 +553,16 @@ fn convert_event(
             block_size,
             lora_id,
             block_mm_infos,
+            medium,
             ..
         } => {
+            tracing::info!(
+                "convert_event: BlockStored with {} blocks, medium={:?}, block_size={}, event_id={}",
+                block_hashes.len(),
+                medium,
+                block_size,
+                event_id
+            );
             let num_block_tokens = vec![block_size as u64; block_hashes.len()];
             let block_hashes_u64: Vec<u64> = block_hashes
                 .into_iter()
@@ -571,6 +582,7 @@ fn convert_event(
                         lora_id.unwrap_or(0),
                         warning_count,
                         block_mm_infos.as_deref(),
+                        medium.clone(),
                     ),
                 }),
                 dp_rank,
@@ -604,6 +616,7 @@ pub fn create_stored_block_from_parts(
     token_ids: &[u32],
     _lora_id: u64,
     mm_extra_info: Option<BlockExtraInfo>,
+    medium: Option<String>,
 ) -> KvCacheStoredBlockData {
     // Compute tokens_hash including MM info if present
     let block_mm_infos = mm_extra_info.as_ref().map(|info| vec![Some(info.clone())]);
@@ -611,17 +624,19 @@ pub fn create_stored_block_from_parts(
         compute_block_hash_for_seq(token_ids, kv_block_size, block_mm_infos.as_deref())[0];
 
     tracing::trace!(
-        "Creating stored block: external_block_hash={}, tokens_hash={}, token_ids={:?}, kv_block_size={}, mm_extra_info={:?}",
+        "Creating stored block: external_block_hash={}, tokens_hash={}, token_ids={:?}, kv_block_size={}, mm_extra_info={:?}, medium={:?}",
         block_hash,
         tokens_hash.0,
         token_ids,
         kv_block_size,
-        mm_extra_info
+        mm_extra_info,
+        medium
     );
     KvCacheStoredBlockData {
         block_hash: ExternalSequenceBlockHash::from(block_hash),
         tokens_hash,
         mm_extra_info,
+        medium,
     }
 }
 
@@ -633,6 +648,7 @@ pub fn create_stored_blocks(
     lora_id: u64,
     warning_count: &Arc<AtomicU32>,
     block_mm_infos: Option<&[Option<BlockExtraInfo>]>,
+    medium: Option<String>,
 ) -> Vec<KvCacheStoredBlockData> {
     let mut blocks: Vec<KvCacheStoredBlockData> = Vec::new();
 
@@ -662,6 +678,7 @@ pub fn create_stored_blocks(
             tokens,
             lora_id,
             mm_extra_info,
+            medium.clone(),
         ));
         token_offset += *num_tokens_it as usize;
     }
@@ -1065,7 +1082,7 @@ mod test_event_processing {
         let token_ids = vec![10, 20, 30, 40];
         let blk_hash = 0xdead_beef;
 
-        let stored = create_stored_block_from_parts(kv_block_size, blk_hash, &token_ids, 0, None);
+        let stored = create_stored_block_from_parts(kv_block_size, blk_hash, &token_ids, 0, None, None);
 
         assert_eq!(stored.block_hash.0, blk_hash);
         let expected_hash = compute_block_hash_for_seq(&token_ids, 4, None)[0];
@@ -1092,6 +1109,7 @@ mod test_event_processing {
             /*lora_id=*/ 0,
             &Arc::new(AtomicU32::new(0)),
             None,
+            None,
         );
 
         assert_eq!(blocks.len(), 2);
@@ -1115,6 +1133,7 @@ mod test_event_processing {
             &block_hashes,
             /*lora_id=*/ 0,
             &warning_count,
+            None,
             None,
         );
 

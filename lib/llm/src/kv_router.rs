@@ -273,6 +273,8 @@ impl Indexer {
         match self {
             Indexer::KvIndexer(indexer) => indexer.find_matches(sequence).await,
             Indexer::None => Ok(OverlapScores {
+                gpu_scores: HashMap::new(),
+                cpu_scores: HashMap::new(),
                 scores: HashMap::new(),
                 frequencies: Vec::new(),
                 tree_sizes: HashMap::new(),
@@ -781,6 +783,14 @@ impl KvPushRouter {
                 )
                 .await?;
 
+            tracing::info!(
+                "Routing decision: Selected worker via find_best_match: worker_id={} dp_rank={:?}, overlap_amount={} (phase={:?})",
+                best_worker.worker_id,
+                best_worker.dp_rank,
+                overlap_amount,
+                phase
+            );
+
             return Ok(WorkerSelection {
                 instance_id: best_worker.worker_id,
                 dp_rank: best_worker.dp_rank,
@@ -790,6 +800,13 @@ impl KvPushRouter {
 
         // Route to pre-selected or explicitly specified worker
         let dp_rank = routing.and_then(|r| r.dp_rank).unwrap_or(0);
+        
+        tracing::info!(
+            "Routing decision: Using pre-selected worker_id={} dp_rank={:?} (phase={:?})",
+            id,
+            dp_rank,
+            phase
+        );
         tracing::debug!(
             worker_id = id,
             dp_rank = dp_rank,

@@ -328,6 +328,7 @@ impl KvEventPublisher {
                         lora_id,
                         &warning_count,
                         mm_infos_rust.as_deref(),
+                        None, // medium: not available from Python bindings
                     ),
                 }),
                 dp_rank,

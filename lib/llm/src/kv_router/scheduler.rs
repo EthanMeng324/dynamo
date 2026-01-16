@@ -549,19 +549,33 @@ impl WorkerSelector for DefaultWorkerSelector {
             .unwrap_or(self.kv_router_config.router_temperature);
         let candidates = softmax_sample(&worker_logits, temperature);
 
-        // If multiple candidates (tied), use tree size as tie-breaker
-        // If tree sizes are also equal, min_by_key uses HashMap iteration order (pseudo-random)
+        // If multiple candidates (tied), use GPU match count, then CPU match count, then tree size as tie-breaker
+        // If all are equal, min_by_key uses HashMap iteration order (pseudo-random)
         let best_worker = if candidates.len() > 1 {
-            tracing::info!("Multiple workers tied with same logit, using tree size as tie-breaker");
+            tracing::info!("Multiple workers tied with same logit, using GPU/CPU match counts and tree size as tie-breaker");
             *candidates
                 .iter()
-                .min_by_key(|worker| {
-                    request
-                        .overlaps
-                        .tree_sizes
-                        .get(worker)
-                        .copied()
-                        .unwrap_or(0)
+                .max_by(|a, b| {
+                    // First compare GPU match counts (higher is better)
+                    let gpu_a = request.overlaps.gpu_scores.get(a).copied().unwrap_or(0);
+                    let gpu_b = request.overlaps.gpu_scores.get(b).copied().unwrap_or(0);
+                    match gpu_a.cmp(&gpu_b) {
+                        std::cmp::Ordering::Equal => {
+                            // If GPU matches are equal, compare CPU match counts (higher is better)
+                            let cpu_a = request.overlaps.cpu_scores.get(a).copied().unwrap_or(0);
+                            let cpu_b = request.overlaps.cpu_scores.get(b).copied().unwrap_or(0);
+                            match cpu_a.cmp(&cpu_b) {
+                                std::cmp::Ordering::Equal => {
+                                    // If CPU matches are also equal, use tree size (lower is better)
+                                    let tree_a = request.overlaps.tree_sizes.get(a).copied().unwrap_or(0);
+                                    let tree_b = request.overlaps.tree_sizes.get(b).copied().unwrap_or(0);
+                                    tree_b.cmp(&tree_a) // Reverse order: lower tree size is better
+                                }
+                                other => other,
+                            }
+                        }
+                        other => other,
+                    }
                 })
                 .expect("candidates should not be empty")
         } else {
@@ -571,6 +585,8 @@ impl WorkerSelector for DefaultWorkerSelector {
         let best_logit = worker_logits[&best_worker];
 
         let best_overlap = *overlaps.get(&best_worker).unwrap_or(&0);
+        let best_gpu_score = request.overlaps.gpu_scores.get(&best_worker).copied().unwrap_or(0);
+        let best_cpu_score = request.overlaps.cpu_scores.get(&best_worker).copied().unwrap_or(0);
 
         // this is a runtime config set on a per worker basis, not per dp-rank
         let total_blocks_info = workers
@@ -588,11 +604,13 @@ impl WorkerSelector for DefaultWorkerSelector {
             .unwrap_or(0);
 
         tracing::info!(
-            "Selected worker: worker_id={} dp_rank={:?}, logit: {:.3}, cached blocks: {}, tree size: {}{}",
+            "Routing decision: worker_id={} dp_rank={:?}, logit={:.3}, total_cached_blocks={}, gpu_matches={}, cpu_matches={}, tree_size={}{}",
             best_worker.worker_id,
             best_worker.dp_rank,
             best_logit,
             best_overlap,
+            best_gpu_score,
+            best_cpu_score,
             tree_size,
             total_blocks_info
         );
