@@ -20,7 +20,7 @@ use tokio_util::sync::CancellationToken;
 use crate::kv_router::{
     KV_EVENT_SUBJECT, RADIX_STATE_BUCKET, RADIX_STATE_FILE,
     indexer::{DumpRequest, GetWorkersRequest, RouterEvent, WorkerKvQueryResponse},
-    protocols::WorkerId,
+    protocols::{KvCacheEventData, WorkerId},
     router_discovery_query,
     worker_query::WorkerQueryClient,
 };
@@ -594,6 +594,17 @@ pub async fn start_kv_router_background(
                                 }
                             };
 
+                            // Log medium information for stored events
+                            if let KvCacheEventData::Stored(ref store_data) = event.event.data {
+                                tracing::info!(
+                                    "NATS subscriber received Stored event: worker_id={}, event_id={}, {} blocks, first_block_medium={:?}",
+                                    event.worker_id,
+                                    event.event.event_id,
+                                    store_data.blocks.len(),
+                                    store_data.blocks.first().and_then(|b| b.medium.as_ref())
+                                );
+                            }
+
                             // Forward the RouterEvent to the indexer
                             if let Err(e) = kv_events_tx.send(event).await {
                                 tracing::warn!(
@@ -830,6 +841,17 @@ pub async fn start_kv_router_background_nats_core(
                             continue;
                         }
                     };
+
+                    // Log medium information for stored events
+                    if let KvCacheEventData::Stored(ref store_data) = event.event.data {
+                        tracing::info!(
+                            "NATS Core subscriber received Stored event: worker_id={}, event_id={}, {} blocks, first_block_medium={:?}",
+                            event.worker_id,
+                            event.event.event_id,
+                            store_data.blocks.len(),
+                            store_data.blocks.first().and_then(|b| b.medium.as_ref())
+                        );
+                    }
 
                     let worker_id = event.worker_id;
                     let event_id = event.event.event_id;
