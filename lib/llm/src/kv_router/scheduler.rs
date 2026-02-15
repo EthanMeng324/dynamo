@@ -549,35 +549,50 @@ impl WorkerSelector for DefaultWorkerSelector {
             .unwrap_or(self.kv_router_config.router_temperature);
         let candidates = softmax_sample(&worker_logits, temperature);
 
-        // If multiple candidates (tied), use GPU match count, then CPU match count, then tree size as tie-breaker
-        // If all are equal, min_by_key uses HashMap iteration order (pseudo-random)
+        // If multiple candidates (tied), use tie-breaker.
+        // kv-strata: GPU match count, then CPU match count, then tree size.
+        // kv (original): tree size only.
         let best_worker = if candidates.len() > 1 {
-            tracing::info!("Multiple workers tied with same logit, using GPU/CPU match counts and tree size as tie-breaker");
-            *candidates
-                .iter()
-                .max_by(|a, b| {
-                    // First compare GPU match counts (higher is better)
-                    let gpu_a = request.overlaps.gpu_scores.get(a).copied().unwrap_or(0);
-                    let gpu_b = request.overlaps.gpu_scores.get(b).copied().unwrap_or(0);
-                    match gpu_a.cmp(&gpu_b) {
-                        std::cmp::Ordering::Equal => {
-                            // If GPU matches are equal, compare CPU match counts (higher is better)
-                            let cpu_a = request.overlaps.cpu_scores.get(a).copied().unwrap_or(0);
-                            let cpu_b = request.overlaps.cpu_scores.get(b).copied().unwrap_or(0);
-                            match cpu_a.cmp(&cpu_b) {
-                                std::cmp::Ordering::Equal => {
-                                    // If CPU matches are also equal, use tree size (lower is better)
-                                    let tree_a = request.overlaps.tree_sizes.get(a).copied().unwrap_or(0);
-                                    let tree_b = request.overlaps.tree_sizes.get(b).copied().unwrap_or(0);
-                                    tree_b.cmp(&tree_a) // Reverse order: lower tree size is better
+            if self.kv_router_config.use_strata_routing {
+                tracing::info!("Multiple workers tied with same logit, using GPU/CPU match counts and tree size as tie-breaker");
+                *candidates
+                    .iter()
+                    .max_by(|a, b| {
+                        let gpu_a = request.overlaps.gpu_scores.get(a).copied().unwrap_or(0);
+                        let gpu_b = request.overlaps.gpu_scores.get(b).copied().unwrap_or(0);
+                        match gpu_a.cmp(&gpu_b) {
+                            std::cmp::Ordering::Equal => {
+                                let cpu_a = request.overlaps.cpu_scores.get(a).copied().unwrap_or(0);
+                                let cpu_b = request.overlaps.cpu_scores.get(b).copied().unwrap_or(0);
+                                match cpu_a.cmp(&cpu_b) {
+                                    std::cmp::Ordering::Equal => {
+                                        let tree_a =
+                                            request.overlaps.tree_sizes.get(a).copied().unwrap_or(0);
+                                        let tree_b =
+                                            request.overlaps.tree_sizes.get(b).copied().unwrap_or(0);
+                                        tree_b.cmp(&tree_a)
+                                    }
+                                    other => other,
                                 }
-                                other => other,
                             }
+                            other => other,
                         }
-                        other => other,
-                    }
-                })
-                .expect("candidates should not be empty")
+                    })
+                    .expect("candidates should not be empty")
+            } else {
+                tracing::info!("Multiple workers tied with same logit, using tree size as tie-breaker (kv mode)");
+                *candidates
+                    .iter()
+                    .min_by_key(|worker| {
+                        request
+                            .overlaps
+                            .tree_sizes
+                            .get(worker)
+                            .copied()
+                            .unwrap_or(0)
+                    })
+                    .expect("candidates should not be empty")
+            }
         } else {
             candidates[0]
         };
@@ -603,17 +618,30 @@ impl WorkerSelector for DefaultWorkerSelector {
             .copied()
             .unwrap_or(0);
 
-        tracing::info!(
-            "Routing decision: worker_id={} dp_rank={:?}, logit={:.3}, total_cached_blocks={}, gpu_matches={}, cpu_matches={}, tree_size={}{}",
-            best_worker.worker_id,
-            best_worker.dp_rank,
-            best_logit,
-            best_overlap,
-            best_gpu_score,
-            best_cpu_score,
-            tree_size,
-            total_blocks_info
-        );
+        let log_msg = if self.kv_router_config.use_strata_routing {
+            format!(
+                "Routing decision: worker_id={} dp_rank={:?}, logit={:.3}, total_cached_blocks={}, gpu_matches={}, cpu_matches={}, tree_size={}{}",
+                best_worker.worker_id,
+                best_worker.dp_rank,
+                best_logit,
+                best_overlap,
+                best_gpu_score,
+                best_cpu_score,
+                tree_size,
+                total_blocks_info
+            )
+        } else {
+            format!(
+                "Routing decision: worker_id={} dp_rank={:?}, logit={:.3}, total_cached_blocks={}, tree_size={}{}",
+                best_worker.worker_id,
+                best_worker.dp_rank,
+                best_logit,
+                best_overlap,
+                tree_size,
+                total_blocks_info
+            )
+        };
+        tracing::info!("{}", log_msg);
 
         Ok(WorkerSelectionResult {
             worker: best_worker,

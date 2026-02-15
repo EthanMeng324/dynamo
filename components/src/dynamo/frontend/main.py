@@ -134,9 +134,9 @@ def parse_args():
     parser.add_argument(
         "--router-mode",
         type=str,
-        choices=["round-robin", "random", "kv"],
+        choices=["round-robin", "random", "kv", "kv-strata"],
         default=os.environ.get("DYN_ROUTER_MODE", "round-robin"),
-        help="How to route the request. Can be set via DYN_ROUTER_MODE env var.",
+        help="How to route the request. 'kv' = original Dynamo logic (GPU cache hit only). 'kv-strata' = consider cache hits from all memory tiers (GPU, CPU, KVBM). Can be set via DYN_ROUTER_MODE env var.",
     )
     parser.add_argument(
         "--kv-overlap-score-weight",
@@ -360,10 +360,10 @@ async def async_main():
 
     # NATS is needed when:
     # 1. Request plane is NATS, OR
-    # 2. Event plane is NATS AND KV router mode AND (KV events OR replica sync enabled)
+    # 2. Event plane is NATS AND KV router mode (kv or kv-strata) AND (KV events OR replica sync enabled)
     enable_nats = flags.request_plane == "nats" or (
         flags.event_plane == "nats"
-        and flags.router_mode == "kv"
+        and flags.router_mode in ("kv", "kv-strata")
         and (flags.use_kv_events or flags.router_replica_sync)
     )
 
@@ -376,8 +376,9 @@ async def async_main():
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, signal_handler)
 
-    if flags.router_mode == "kv":
+    if flags.router_mode in ("kv", "kv-strata"):
         router_mode = RouterMode.KV
+        use_strata_routing = flags.router_mode == "kv-strata"
         kv_router_config = KvRouterConfig(
             overlap_score_weight=flags.kv_overlap_score_weight,
             router_temperature=flags.router_temperature,
@@ -391,6 +392,7 @@ async def async_main():
             router_ttl_secs=flags.router_ttl,
             router_max_tree_size=flags.router_max_tree_size,
             router_prune_target_ratio=flags.router_prune_target_ratio,
+            use_strata_routing=use_strata_routing,
         )
     elif flags.router_mode == "random":
         router_mode = RouterMode.Random

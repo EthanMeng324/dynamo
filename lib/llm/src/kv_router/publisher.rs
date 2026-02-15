@@ -505,27 +505,27 @@ pub async fn start_zmq_listener(
                     continue;
                 };
 
-                tracing::info!(
-                    "ZMQ listener on {} received batch with {} events (seq={}, dp_rank={})",
-                    zmq_endpoint,
-                    batch.events.len(),
-                    seq,
-                    batch.data_parallel_rank.unwrap_or(0)
-                );
+                // tracing::info!(
+                //     "ZMQ listener on {} received batch with {} events (seq={}, dp_rank={})",
+                //     zmq_endpoint,
+                //     batch.events.len(),
+                //     seq,
+                //     batch.data_parallel_rank.unwrap_or(0)
+                // );
 
                 let dp_rank = batch.data_parallel_rank.unwrap_or(0) as u32;
-                for raw_event in batch.events.into_iter() {
-                    tracing::info!(
-                        "ZMQ listener: Processing raw event, checking medium field..."
-                    );
-                    let event = convert_event(raw_event, seq, kv_block_size, dp_rank, &warning_count);
-                    if tx.send(event).is_err() {
-                        tracing::warn!("Failed to send message to channel - receiver dropped");
-                        exit_reason = "channel receiver dropped";
-                        break 'main;
-                    }
-                    messages_processed += 1;
-                }
+                // for raw_event in batch.events.into_iter() {
+                //     tracing::info!(
+                //         "ZMQ listener: Processing raw event, checking medium field..."
+                //     );
+                //     let event = convert_event(raw_event, seq, kv_block_size, dp_rank, &warning_count);
+                //     if tx.send(event).is_err() {
+                //         tracing::warn!("Failed to send message to channel - receiver dropped");
+                //         exit_reason = "channel receiver dropped";
+                //         break 'main;
+                //     }
+                //     messages_processed += 1;
+                // }
             }
         }
     }
@@ -556,13 +556,13 @@ fn convert_event(
             medium,
             ..
         } => {
-            tracing::info!(
-                "convert_event: BlockStored with {} blocks, medium={:?}, block_size={}, event_id={}",
-                block_hashes.len(),
-                medium,
-                block_size,
-                event_id
-            );
+            // tracing::info!(
+            //     "convert_event: BlockStored with {} blocks, medium={:?}, block_size={}, event_id={}",
+            //     block_hashes.len(),
+            //     medium,
+            //     block_size,
+            //     event_id
+            // );
             let num_block_tokens = vec![block_size as u64; block_hashes.len()];
             let block_hashes_u64: Vec<u64> = block_hashes
                 .into_iter()

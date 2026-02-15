@@ -425,8 +425,10 @@ impl RadixTree {
 
         // Spawn dedicated thread with simplified sync processing
         std::thread::spawn(move || {
-            let mut radix_tree =
-                llm_rs::kv_router::indexer::RadixTree::new_with_frequency(expiration_duration);
+            let mut radix_tree = llm_rs::kv_router::indexer::RadixTree::new_with_frequency(
+                expiration_duration,
+                false, // use_strata_routing - Python RadixTree uses kv mode
+            );
 
             loop {
                 match request_rx.recv() {
@@ -793,6 +795,7 @@ impl ApproxKvIndexer {
                     kv_block_size as u32,
                     kv_indexer_metrics,
                     Some(prune_config),
+                    false, // use_strata_routing - not used for ApproxKvIndexer
                 )
                 .into();
 

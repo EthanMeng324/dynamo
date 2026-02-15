@@ -520,6 +520,7 @@ pub unsafe extern "C" fn dynamo_create_worker_selection_pipeline(
                 None, // router_ttl_secs
                 None, // router_max_tree_size
                 None, // router_prune_target_ratio
+                None, // use_strata_routing - C API uses kv mode
             ))
         } else {
             None

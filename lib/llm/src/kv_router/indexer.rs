@@ -225,6 +225,10 @@ pub struct RadixTree {
 
     /// The time buffer the radix tree should check when considering frequence of block accesses
     expiration_duration: Option<Duration>,
+
+    /// When false (kv mode), only consider GPU cache hits (original Dynamo behavior).
+    /// When true (kv-strata mode), consider cache hits from all memory tiers (GPU, CPU, KVBM).
+    use_strata_routing: bool,
 }
 
 impl Default for RadixTree {
@@ -272,16 +276,20 @@ impl RadixTree {
     /// ### Returns
     ///
     /// A new `RadixTree`.
-    pub fn new_with_frequency(expiration_duration: Option<Duration>) -> Self {
+    pub fn new_with_frequency(
+        expiration_duration: Option<Duration>,
+        use_strata_routing: bool,
+    ) -> Self {
         Self {
             root: Rc::new(RefCell::new(RadixBlock::new())),
             lookup: HashMap::new(),
             expiration_duration,
+            use_strata_routing,
         }
     }
 
     pub fn new() -> Self {
-        Self::new_with_frequency(None)
+        Self::new_with_frequency(None, false)
     }
 
     /// Traverse the radix tree to find the best match for a given sequence of [`LocalBlockHash`]es.
@@ -312,7 +320,10 @@ impl RadixTree {
             if let Some(block) = next_block {
                 {
                     let block_borrow = block.borrow();
-                    scores.update_scores(block_borrow.workers.iter());
+                    scores.update_scores(
+                        block_borrow.workers.iter(),
+                        self.use_strata_routing,
+                    );
                 } // block_borrow is dropped here
 
                 if let Some(expiration_duration) = self.expiration_duration {
@@ -456,30 +467,35 @@ impl RadixTree {
                         };
 
                         // add/update our worker's info for this block, tracking both GPU and CPU presence.
+                        // In kv mode (!use_strata_routing), only store GPU blocks (original Dynamo behavior).
                         let is_gpu = block_data
                             .medium
                             .as_deref()
                             .map(|m| m.eq_ignore_ascii_case("GPU"))
-                            .unwrap_or(false);
+                            .unwrap_or(true); // None means GPU for backward compat
 
-                        child_mut
-                            .workers
-                            .entry(worker)
-                            .and_modify(|info| {
-                                if is_gpu {
-                                    info.gpu_block_hash = Some(block_data.block_hash);
-                                } else {
-                                    info.cpu_block_hash = Some(block_data.block_hash);
-                                }
-                            })
-                            .or_insert_with(|| WorkerBlockInfo {
-                                gpu_block_hash: is_gpu.then_some(block_data.block_hash),
-                                cpu_block_hash: (!is_gpu).then_some(block_data.block_hash),
-                            });
+                        let should_store = self.use_strata_routing
+                            || is_gpu; // kv mode: only GPU; kv-strata: all
+
+                        if should_store {
+                            child_mut
+                                .workers
+                                .entry(worker)
+                                .and_modify(|info| {
+                                    if is_gpu {
+                                        info.gpu_block_hash = Some(block_data.block_hash);
+                                    } else {
+                                        info.cpu_block_hash = Some(block_data.block_hash);
+                                    }
+                                })
+                                .or_insert_with(|| WorkerBlockInfo {
+                                    gpu_block_hash: is_gpu.then_some(block_data.block_hash),
+                                    cpu_block_hash: (!is_gpu).then_some(block_data.block_hash),
+                                });
+                            // add the block to the worker's lookup table (only when we store)
+                            worker_lookup.insert(block_data.block_hash, child.clone());
+                        }
                     }
-
-                    // add the block to the worker's lookup table
-                    worker_lookup.insert(block_data.block_hash, child.clone());
 
                     // drop child so we can shift current to this block
                     drop(parent_mut);
@@ -802,24 +818,28 @@ impl OverlapScores {
     /// ### Arguments
     ///
     /// * `worker_blocks` - An iterator over `(&WorkerWithDpRank, &WorkerBlockInfo)` tuples.
-    pub(crate) fn update_scores<'a, I>(&mut self, worker_blocks: I)
+    /// * `use_strata_routing` - When false (kv mode), only count GPU blocks. When true (kv-strata), count both GPU and CPU.
+    pub(crate) fn update_scores<'a, I>(&mut self, worker_blocks: I, use_strata_routing: bool)
     where
         I: IntoIterator<Item = (&'a WorkerWithDpRank, &'a WorkerBlockInfo)>,
     {
         for (worker, block_info) in worker_blocks {
-            // Prefer GPU when both tiers exist. Count CPU only when GPU is absent.
-            if block_info.gpu_block_hash.is_some() {
+            // kv mode: only count GPU. kv-strata: count both (prefer GPU when both exist).
+            let count_gpu = block_info.gpu_block_hash.is_some();
+            let count_cpu = use_strata_routing && block_info.cpu_block_hash.is_some()
+                && block_info.gpu_block_hash.is_none();
+
+            if count_gpu {
                 let score = self.gpu_scores.entry(*worker).or_insert(0);
                 *score += 1;
-            } else if block_info.cpu_block_hash.is_some() {
+            } else if count_cpu {
                 let score = self.cpu_scores.entry(*worker).or_insert(0);
                 *score += 1;
             } else {
-                // Should not happen; ignore.
                 continue;
             }
-            
-            // Update legacy total score for backward compatibility
+
+            // Total score for overlap/cost calculation
             let total_score = self.scores.entry(*worker).or_insert(0);
             *total_score += 1;
         }
@@ -978,6 +998,7 @@ impl KvIndexer {
         kv_block_size: u32,
         metrics: Arc<KvIndexerMetrics>,
         prune_config: Option<PruneConfig>,
+        use_strata_routing: bool,
     ) -> Self {
         let (event_tx, event_rx) = mpsc::channel::<RouterEvent>(2048);
         let (match_tx, match_rx) = mpsc::channel::<MatchRequest>(128);
@@ -1003,7 +1024,7 @@ impl KvIndexer {
                 let mut remove_worker_rx = remove_worker_rx;
                 let mut get_workers_rx = get_workers_rx;
                 let mut dump_rx = dump_rx;
-                let mut trie = RadixTree::new_with_frequency(expiration_duration);
+                let mut trie = RadixTree::new_with_frequency(expiration_duration, use_strata_routing);
 
                 // Create PruneManager if prune_config is specified
                 let mut prune_manager = prune_config.map(|config| {
@@ -1206,7 +1227,7 @@ impl KvIndexer {
         kv_block_size: u32,
         metrics: Arc<KvIndexerMetrics>,
     ) -> Self {
-        Self::new_with_frequency(token, None, kv_block_size, metrics, None)
+        Self::new_with_frequency(token, None, kv_block_size, metrics, None, false)
     }
 
     /// Get a sender for `RouterEvent`s.
@@ -1694,6 +1715,7 @@ impl KvIndexerSharded {
         kv_block_size: u32,
         metrics: Arc<KvIndexerMetrics>,
         prune_config: Option<PruneConfig>,
+        use_strata_routing: bool,
     ) -> Self {
         let worker_assignments: HashMap<WorkerId, usize> = HashMap::new();
         let worker_counts: Vec<usize> = vec![0; num_shards];
@@ -1735,7 +1757,8 @@ impl KvIndexerSharded {
 
             tasks.push(std::thread::spawn(move || {
                 runtime.block_on(async move {
-                    let mut trie = RadixTree::new_with_frequency(expiration_duration);
+                    let mut trie =
+                        RadixTree::new_with_frequency(expiration_duration, use_strata_routing);
 
                     // Create PruneManager if prune_config is specified
                     let mut prune_manager = prune_config_clone.map(|config| {
@@ -1943,7 +1966,7 @@ impl KvIndexerSharded {
         kv_block_size: u32,
         metrics: Arc<KvIndexerMetrics>,
     ) -> Self {
-        Self::new_with_frequency(token, num_shards, None, kv_block_size, metrics, None)
+        Self::new_with_frequency(token, num_shards, None, kv_block_size, metrics, None, false)
     }
 }
 
@@ -2850,6 +2873,7 @@ mod tests {
                 kv_block_size,
                 metrics,
                 None,
+                false,
             ));
         } else {
             kv_indexer = Box::new(KvIndexerSharded::new_with_frequency(
@@ -2859,6 +2883,7 @@ mod tests {
                 kv_block_size,
                 metrics,
                 None,
+                false,
             ));
         }
 

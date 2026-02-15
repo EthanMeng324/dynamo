@@ -342,6 +342,7 @@ mod tests {
             KV_BLOCK_SIZE,
             metrics,
             Some(prune_config),
+            false,
         );
 
         let tokens: Vec<u32> = vec![1, 2, 3, 4]; // Exactly one KV block
@@ -397,6 +398,7 @@ mod tests {
             KV_BLOCK_SIZE,
             metrics,
             Some(prune_config),
+            false,
         );
 
         let tokens: Vec<u32> = vec![10, 11, 12, 13];
@@ -449,6 +451,7 @@ mod tests {
             KV_BLOCK_SIZE,
             metrics,
             Some(prune_config),
+            false,
         );
 
         let tokens: Vec<u32> = vec![100, 101, 102, 103];
@@ -521,6 +524,7 @@ mod tests {
             KV_BLOCK_SIZE,
             metrics,
             Some(prune_config),
+            false,
         );
 
         // Sequence A : single block
@@ -580,6 +584,7 @@ mod tests {
             KV_BLOCK_SIZE,
             metrics,
             Some(prune_config),
+            false,
         );
 
         let tokens: Vec<u32> = vec![9, 8, 7, 6];
@@ -759,6 +764,7 @@ mod tests {
             KV_BLOCK_SIZE,
             metrics,
             Some(prune_config),
+            false,
         );
 
         let worker = WorkerWithDpRank::from_worker_id(42);

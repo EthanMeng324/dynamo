@@ -1,8 +1,33 @@
 BASE=$(conda info --base)
 export LD_LIBRARY_PATH="$BASE/lib:$LD_LIBRARY_PATH"
 
+### Single Node:
 python -m dynamo.frontend --router-mode kv
 
+CUDA_VISIBLE_DEVICES=0 \
+LMCACHE_CONFIG_FILE=lmcache.yaml \
+python -m dynamo.vllm \
+  --model Qwen/Qwen2.5-7B-Instruct \
+  --gpu-memory-utilization 0.8 \
+  --connector lmcache \
+  --kv-events-config '{"enable_kv_cache_events":"True","publisher":"zmq","topic":"kv-events"}'
+
+### Multi Node:
+#### s7:
+export HEAD_NODE_IP="192.168.3.67"
+export NATS_SERVER="nats://${HEAD_NODE_IP}:4222"
+export ETCD_ENDPOINTS="${HEAD_NODE_IP}:2379"
+
+python -m dynamo.frontend --router-mode kv
+
+sudo -E env CUDA_VISIBLE_DEVICES=0 \
+LMCACHE_CONFIG_FILE=lmcache.yaml \
+./venv/bin/python -m dynamo.vllm \
+  --model Qwen/Qwen2.5-7B-Instruct \
+  --gpu-memory-utilization 0.8 \
+  --connector lmcache \
+  --kv-events-config '{"enable_kv_cache_events":"True","publisher":"zmq","topic":"kv-events"}'
+#### s6:
 CUDA_VISIBLE_DEVICES=0 \
 LMCACHE_CONFIG_FILE=lmcache.yaml \
 python -m dynamo.vllm \

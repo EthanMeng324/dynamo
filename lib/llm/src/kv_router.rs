@@ -162,6 +162,10 @@ pub struct KvRouterConfig {
 
     /// Target size ratio after pruning (only used when use_kv_events is false, default: 0.8)
     pub router_prune_target_ratio: f64,
+
+    /// When true (kv-strata mode), consider cache hits from all memory tiers (GPU, CPU, KVBM).
+    /// When false (kv mode), only consider GPU cache hits (original Dynamo behavior).
+    pub use_strata_routing: bool,
 }
 
 impl Default for KvRouterConfig {
@@ -179,6 +183,7 @@ impl Default for KvRouterConfig {
             router_ttl_secs: 120.0,
             router_max_tree_size: 2usize.pow(20), // 2^20 = 1048576, matches PruneConfig::default()
             router_prune_target_ratio: 0.8,
+            use_strata_routing: false, // original Dynamo: only GPU cache hit
         }
     }
 }
@@ -200,6 +205,7 @@ impl KvRouterConfig {
         router_ttl_secs: Option<f64>,
         router_max_tree_size: Option<usize>,
         router_prune_target_ratio: Option<f64>,
+        use_strata_routing: Option<bool>,
     ) -> Self {
         let default = Self::default();
         Self {
@@ -219,6 +225,7 @@ impl KvRouterConfig {
             router_max_tree_size: router_max_tree_size.unwrap_or(default.router_max_tree_size),
             router_prune_target_ratio: router_prune_target_ratio
                 .unwrap_or(default.router_prune_target_ratio),
+            use_strata_routing: use_strata_routing.unwrap_or(default.use_strata_routing),
         }
     }
 
@@ -382,6 +389,7 @@ impl KvRouter {
                 block_size,
                 kv_indexer_metrics,
                 prune_config,
+                kv_router_config.use_strata_routing,
             ))
         };
 
