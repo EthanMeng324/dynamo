@@ -514,18 +514,18 @@ pub async fn start_zmq_listener(
                 // );
 
                 let dp_rank = batch.data_parallel_rank.unwrap_or(0) as u32;
-                // for raw_event in batch.events.into_iter() {
-                //     tracing::info!(
-                //         "ZMQ listener: Processing raw event, checking medium field..."
-                //     );
-                //     let event = convert_event(raw_event, seq, kv_block_size, dp_rank, &warning_count);
-                //     if tx.send(event).is_err() {
-                //         tracing::warn!("Failed to send message to channel - receiver dropped");
-                //         exit_reason = "channel receiver dropped";
-                //         break 'main;
-                //     }
-                //     messages_processed += 1;
-                // }
+                for raw_event in batch.events.into_iter() {
+                    // tracing::info!(
+                    //     "ZMQ listener: Processing raw event, checking medium field..."
+                    // );
+                    let event = convert_event(raw_event, seq, kv_block_size, dp_rank, &warning_count);
+                    if tx.send(event).is_err() {
+                        tracing::warn!("Failed to send message to channel - receiver dropped");
+                        exit_reason = "channel receiver dropped";
+                        break 'main;
+                    }
+                    messages_processed += 1;
+                }
             }
         }
     }
