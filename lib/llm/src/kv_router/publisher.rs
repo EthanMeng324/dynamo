@@ -54,6 +54,7 @@ const INITIAL_BACKOFF_MS: u64 = 10;
 const MAX_BACKOFF_MS: u64 = 5000;
 const MAX_CONSECUTIVE_ERRORS: u32 = 10;
 const MAX_BACKOFF_EXPONENT: u32 = 8; // Cap at 2^8 = 256x multiplier to prevent overflow
+const KV_PUBLISHER_BUILD_MARKER: &str = "kvpub-build-2026-02-16-source-tag-v1";
 
 // -------------------------------------------------------------------------
 // KV Event Publishers -----------------------------------------------------
@@ -146,7 +147,7 @@ impl KvEventPublisher {
 
         let component_name = component.name();
         tracing::info!(
-            "Initializing KvEventPublisher for worker {worker_id} in component {component_name}"
+            "Initializing KvEventPublisher for worker {worker_id} in component {component_name} (marker={KV_PUBLISHER_BUILD_MARKER})"
         );
 
         if enable_local_indexer {
@@ -326,6 +327,16 @@ async fn start_event_processor<P: EventSink + Send + Sync + 'static>(
                 // Encapsulate in a router event.
                 tracing::trace!("Event processor for worker_id {} processing event: {:?}", worker_id, event.data);
                 let router_event = RouterEvent::new(worker_id, event);
+                if let KvCacheEventData::Stored(store) = &router_event.event.data
+                    && store.blocks.is_empty()
+                {
+                    tracing::warn!(
+                        "Publishing EMPTY Stored event (source=event_plane, worker_id={}, event_id={}, dp_rank={})",
+                        router_event.worker_id,
+                        router_event.event.event_id,
+                        router_event.event.dp_rank
+                    );
+                }
 
                 // Apply to local indexer first (if present)
                 if let Some(indexer) = &local_indexer {
@@ -372,6 +383,16 @@ async fn start_event_processor_jetstream(
                 // Encapsulate in a router event.
                 tracing::trace!("Event processor for worker_id {} processing event: {:?}", worker_id, event.data);
                 let router_event = RouterEvent::new(worker_id, event);
+                if let KvCacheEventData::Stored(store) = &router_event.event.data
+                    && store.blocks.is_empty()
+                {
+                    tracing::warn!(
+                        "Publishing EMPTY Stored event (source=jetstream_publisher, worker_id={}, event_id={}, dp_rank={})",
+                        router_event.worker_id,
+                        router_event.event.event_id,
+                        router_event.event.dp_rank
+                    );
+                }
 
                 // Apply to local indexer first (if present)
                 if let Some(indexer) = &local_indexer {

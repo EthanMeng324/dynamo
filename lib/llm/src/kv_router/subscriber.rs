@@ -267,6 +267,18 @@ pub async fn recover_from_worker(
 
     // Apply recovered events to the indexer
     for event in events {
+        if let KvCacheEventData::Stored(store) = &event.event.data
+            && store.blocks.is_empty()
+        {
+            tracing::warn!(
+                "Recovered EMPTY Stored event from worker query: worker_id={}, event_id={}, dp_rank={}, start_event_id={:?}, end_event_id={:?}",
+                event.worker_id,
+                event.event.event_id,
+                event.event.dp_rank,
+                start_event_id,
+                end_event_id
+            );
+        }
         if let Err(e) = event_tx.send(event).await {
             tracing::error!(
                 "Failed to send recovered event to indexer for worker {worker_id}: {e}"
@@ -350,6 +362,16 @@ async fn download_stable_snapshot(
 
     // Send all events to the indexer
     for event in prev_events {
+        if let KvCacheEventData::Stored(store) = &event.event.data
+            && store.blocks.is_empty()
+        {
+            tracing::warn!(
+                "Loaded EMPTY Stored event from snapshot: worker_id={}, event_id={}, dp_rank={}",
+                event.worker_id,
+                event.event.event_id,
+                event.event.dp_rank
+            );
+        }
         if let Err(e) = kv_events_tx.send(event).await {
             tracing::warn!("Failed to send initial event to indexer: {e:?}");
         }
