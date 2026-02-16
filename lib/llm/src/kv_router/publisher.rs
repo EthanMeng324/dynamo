@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::fmt;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
@@ -434,6 +435,7 @@ pub async fn start_zmq_listener(
     #[allow(unused_assignments)]
     let mut exit_reason = "unknown";
     let mut messages_processed = 0u64;
+    let mut expanded_block_hashes: HashMap<u64, Vec<u64>> = HashMap::new();
 
     'main: loop {
         tokio::select! {
@@ -518,7 +520,14 @@ pub async fn start_zmq_listener(
                     // tracing::info!(
                     //     "ZMQ listener: Processing raw event, checking medium field..."
                     // );
-                    let event = convert_event(raw_event, seq, kv_block_size, dp_rank, &warning_count);
+                    let event = convert_event(
+                        raw_event,
+                        seq,
+                        kv_block_size,
+                        dp_rank,
+                        &warning_count,
+                        &mut expanded_block_hashes,
+                    );
                     if tx.send(event).is_err() {
                         tracing::warn!("Failed to send message to channel - receiver dropped");
                         exit_reason = "channel receiver dropped";
@@ -544,6 +553,7 @@ fn convert_event(
     kv_block_size: u32,
     dp_rank: u32,
     warning_count: &Arc<AtomicU32>,
+    expanded_block_hashes: &mut HashMap<u64, Vec<u64>>,
 ) -> KvCacheEvent {
     match raw {
         RawKvEvent::BlockStored {
@@ -556,44 +566,239 @@ fn convert_event(
             medium,
             ..
         } => {
-            // tracing::info!(
-            //     "convert_event: BlockStored with {} blocks, medium={:?}, block_size={}, event_id={}",
-            //     block_hashes.len(),
-            //     medium,
-            //     block_size,
-            //     event_id
-            // );
-            let num_block_tokens = vec![block_size as u64; block_hashes.len()];
-            let block_hashes_u64: Vec<u64> = block_hashes
+            let num_blocks = block_hashes.len();
+            let token_ids_len = token_ids.len();
+            let original_parent_raw = parent_block_hash.map(BlockHashValue::into_u64);
+            let tokens_per_event_block = if num_blocks > 0 && token_ids_len % num_blocks == 0 {
+                Some(token_ids_len / num_blocks)
+            } else {
+                None
+            }
+            .unwrap_or(block_size);
+
+            let original_hashes: Vec<u64> = block_hashes
                 .into_iter()
                 .map(BlockHashValue::into_u64)
                 .collect();
+            // LMCache may use 0 as a root sentinel. Treat it as "no parent".
+            let parent_hash = parent_block_hash
+                .map(BlockHashValue::into_u64)
+                .and_then(|parent| {
+                    if parent == 0 {
+                        None
+                    } else {
+                        Some(ExternalSequenceBlockHash::from(parent))
+                    }
+                })
+                .map(|parent| {
+                    expanded_block_hashes
+                        .get(&parent.0)
+                        .and_then(|expanded| expanded.last().copied())
+                        .map(ExternalSequenceBlockHash::from)
+                        .unwrap_or(parent)
+                });
+
+            // Upstream occasionally provides token_ids with empty block_hashes.
+            // Recover by deriving stable per-chunk hashes from token content so events stay usable.
+            if original_hashes.is_empty() && !token_ids.is_empty() {
+                let mut blocks = Vec::new();
+                let kv_chunk = kv_block_size as usize;
+                for (chunk_idx, chunk_tokens) in token_ids.chunks(kv_chunk).enumerate() {
+                    let block_mm_infos = block_mm_infos
+                        .as_deref()
+                        .and_then(|infos| infos.first())
+                        .and_then(|opt| opt.clone())
+                        .map(|info| vec![Some(info)]);
+                    let tokens_hash =
+                        compute_block_hash_for_seq(chunk_tokens, kv_block_size, block_mm_infos.as_deref())[0];
+                    let block_hash = derive_expanded_block_hash(
+                        event_id ^ 0x5f37_59df_u64,
+                        chunk_idx,
+                        tokens_hash,
+                    );
+                    blocks.push(KvCacheStoredBlockData {
+                        block_hash,
+                        tokens_hash,
+                        mm_extra_info: block_mm_infos
+                            .and_then(|mut infos| infos.pop())
+                            .and_then(|opt| opt),
+                        medium: medium.clone(),
+                    });
+                }
+
+                tracing::debug!(
+                    "KV BlockStored converted: event_id={}, dp_rank={}, path=token_only_fallback, raw_num_blocks={}, raw_token_ids_len={}, raw_block_size={}, inferred_tokens_per_event_block={}, out_blocks={}, medium={:?}, parent_raw={:?}, parent_mapped={:?}",
+                    event_id,
+                    dp_rank,
+                    num_blocks,
+                    token_ids_len,
+                    block_size,
+                    tokens_per_event_block,
+                    blocks.len(),
+                    medium,
+                    original_parent_raw,
+                    parent_hash,
+                );
+
+                return KvCacheEvent {
+                    event_id,
+                    data: KvCacheEventData::Stored(KvCacheStoreData { parent_hash, blocks }),
+                    dp_rank,
+                };
+            }
+
+            // Fast path: already aligned with kv_block_size
+            let (conversion_path, blocks) = if tokens_per_event_block == kv_block_size as usize {
+                let num_block_tokens = vec![kv_block_size as u64; num_blocks];
+                let blocks = create_stored_blocks(
+                    kv_block_size,
+                    &token_ids,
+                    &num_block_tokens,
+                    &original_hashes,
+                    lora_id.unwrap_or(0),
+                    warning_count,
+                    block_mm_infos.as_deref(),
+                    medium.clone(),
+                );
+                for hash in &original_hashes {
+                    expanded_block_hashes.insert(*hash, vec![*hash]);
+                }
+                ("aligned", blocks)
+            } else if tokens_per_event_block % kv_block_size as usize == 0 {
+                // Compatibility path: LMCache events may use larger logical blocks (e.g. 256).
+                // Split to kv_block_size chunks so radix matching remains consistent with router hashing.
+                let mut blocks = Vec::new();
+                let mut token_offset = 0usize;
+                let subblocks_per_block = tokens_per_event_block / kv_block_size as usize;
+
+                for (block_idx, original_hash) in original_hashes.iter().enumerate() {
+                    let mm_extra_info = block_mm_infos
+                        .as_deref()
+                        .and_then(|infos| infos.get(block_idx))
+                        .and_then(|opt| opt.clone());
+
+                    let mut expanded_hashes_for_block = Vec::with_capacity(subblocks_per_block);
+                    for sub_idx in 0..subblocks_per_block {
+                        let end = token_offset + kv_block_size as usize;
+                        if end > token_ids.len() {
+                            // Fallback: preserve chain semantics even when payload is shorter than expected.
+                            let fallback_hash = derive_expanded_block_hash(
+                                *original_hash,
+                                sub_idx,
+                                LocalBlockHash(*original_hash),
+                            );
+                            expanded_hashes_for_block.push(fallback_hash.0);
+                            blocks.push(KvCacheStoredBlockData {
+                                block_hash: fallback_hash,
+                                tokens_hash: LocalBlockHash(*original_hash),
+                                mm_extra_info: mm_extra_info.clone(),
+                                medium: medium.clone(),
+                            });
+                            continue;
+                        }
+                        let tokens = &token_ids[token_offset..end];
+                        token_offset = end;
+
+                        let block_mm_infos = mm_extra_info.as_ref().map(|info| vec![Some(info.clone())]);
+                        let tokens_hash =
+                            compute_block_hash_for_seq(tokens, kv_block_size, block_mm_infos.as_deref())[0];
+                        let derived_hash = derive_expanded_block_hash(*original_hash, sub_idx, tokens_hash);
+                        expanded_hashes_for_block.push(derived_hash.0);
+                        blocks.push(KvCacheStoredBlockData {
+                            block_hash: derived_hash,
+                            tokens_hash,
+                            mm_extra_info: mm_extra_info.clone(),
+                            medium: medium.clone(),
+                        });
+                    }
+
+                    if expanded_hashes_for_block.is_empty() {
+                        expanded_block_hashes.remove(original_hash);
+                    } else {
+                        expanded_block_hashes.insert(*original_hash, expanded_hashes_for_block);
+                    }
+                }
+
+                ("split_large_block", blocks)
+            } else {
+                // Geometry mismatch fallback: keep one block per incoming hash so parent/child chain remains valid.
+                if warning_count.fetch_add(1, Ordering::Relaxed) < 10 {
+                    tracing::warn!(
+                        "KV BlockStored geometry mismatch; using fallback hashing (event_id={}, kv_block_size={}, event_block_size={}, inferred_tokens_per_block={}, num_blocks={}, token_ids_len={})",
+                        event_id,
+                        kv_block_size,
+                        block_size,
+                        tokens_per_event_block,
+                        num_blocks,
+                        token_ids_len
+                    );
+                }
+                let mut blocks = Vec::with_capacity(original_hashes.len());
+                for original_hash in &original_hashes {
+                    expanded_block_hashes.insert(*original_hash, vec![*original_hash]);
+                    blocks.push(KvCacheStoredBlockData {
+                        block_hash: ExternalSequenceBlockHash::from(*original_hash),
+                        tokens_hash: LocalBlockHash(*original_hash),
+                        mm_extra_info: None,
+                        medium: medium.clone(),
+                    });
+                }
+                ("geometry_mismatch_fallback", blocks)
+            };
+
+            if blocks.is_empty() {
+                tracing::warn!(
+                    "KV BlockStored converted to 0 blocks: event_id={}, dp_rank={}, path={}, raw_num_blocks={}, raw_token_ids_len={}, raw_block_size={}, inferred_tokens_per_event_block={}, medium={:?}, parent_raw={:?}, parent_mapped={:?}, first_hash={:?}",
+                    event_id,
+                    dp_rank,
+                    conversion_path,
+                    num_blocks,
+                    token_ids_len,
+                    block_size,
+                    tokens_per_event_block,
+                    medium,
+                    original_parent_raw,
+                    parent_hash,
+                    original_hashes.first(),
+                );
+            } else {
+                tracing::debug!(
+                    "KV BlockStored converted: event_id={}, dp_rank={}, path={}, raw_num_blocks={}, raw_token_ids_len={}, raw_block_size={}, inferred_tokens_per_event_block={}, out_blocks={}, medium={:?}, parent_raw={:?}, parent_mapped={:?}",
+                    event_id,
+                    dp_rank,
+                    conversion_path,
+                    num_blocks,
+                    token_ids_len,
+                    block_size,
+                    tokens_per_event_block,
+                    blocks.len(),
+                    medium,
+                    original_parent_raw,
+                    parent_hash,
+                );
+            }
+
             KvCacheEvent {
                 event_id,
                 data: KvCacheEventData::Stored(KvCacheStoreData {
-                    parent_hash: parent_block_hash
-                        .map(BlockHashValue::into_u64)
-                        .map(ExternalSequenceBlockHash::from),
-                    blocks: create_stored_blocks(
-                        kv_block_size,
-                        &token_ids,
-                        &num_block_tokens,
-                        &block_hashes_u64,
-                        lora_id.unwrap_or(0),
-                        warning_count,
-                        block_mm_infos.as_deref(),
-                        medium.clone(),
-                    ),
+                    parent_hash,
+                    blocks,
                 }),
                 dp_rank,
             }
         }
         RawKvEvent::BlockRemoved { block_hashes, .. } => {
-            let hashes = block_hashes
+            let mut hashes = Vec::new();
+            for block_hash in block_hashes
                 .into_iter()
                 .map(BlockHashValue::into_u64)
-                .map(ExternalSequenceBlockHash::from)
-                .collect();
+            {
+                if let Some(expanded_hashes) = expanded_block_hashes.remove(&block_hash) {
+                    hashes.extend(expanded_hashes.into_iter().map(ExternalSequenceBlockHash::from));
+                } else {
+                    hashes.push(ExternalSequenceBlockHash::from(block_hash));
+                }
+            }
             KvCacheEvent {
                 event_id,
                 data: KvCacheEventData::Removed(KvCacheRemoveData {
@@ -602,12 +807,27 @@ fn convert_event(
                 dp_rank,
             }
         }
-        RawKvEvent::AllBlocksCleared => KvCacheEvent {
-            event_id,
-            data: KvCacheEventData::Cleared,
-            dp_rank,
-        },
+        RawKvEvent::AllBlocksCleared => {
+            expanded_block_hashes.clear();
+            KvCacheEvent {
+                event_id,
+                data: KvCacheEventData::Cleared,
+                dp_rank,
+            }
+        }
     }
+}
+
+fn derive_expanded_block_hash(
+    original_hash: u64,
+    sub_idx: usize,
+    tokens_hash: LocalBlockHash,
+) -> ExternalSequenceBlockHash {
+    let mix = original_hash
+        ^ tokens_hash.0.rotate_left(17)
+        ^ (sub_idx as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    let mixed = mix.wrapping_mul(0xbf58_476d_1ce4_e5b9).rotate_left(29);
+    ExternalSequenceBlockHash(mixed)
 }
 
 pub fn create_stored_block_from_parts(
@@ -1148,6 +1368,7 @@ mod test_event_processing {
     #[test]
     fn test_convert_event_block_stored() {
         let kv_block_size = 4;
+        let mut expanded_block_hashes = HashMap::new();
         let raw_evt = RawKvEvent::BlockStored {
             block_hashes: vec![BlockHashValue::Unsigned(10), BlockHashValue::Unsigned(11)],
             parent_block_hash: Some(BlockHashValue::Unsigned(99)),
@@ -1159,18 +1380,33 @@ mod test_event_processing {
             block_mm_infos: None,
         };
 
-        let out = convert_event(raw_evt, 42, kv_block_size, 0, &Arc::new(AtomicU32::new(0)));
+        let out = convert_event(
+            raw_evt,
+            42,
+            kv_block_size,
+            0,
+            &Arc::new(AtomicU32::new(0)),
+            &mut expanded_block_hashes,
+        );
         assert!(matches!(out.data, KvCacheEventData::Stored(_)));
     }
 
     #[test]
     fn test_convert_event_block_removed() {
         let kv_block_size = 4;
+        let mut expanded_block_hashes = HashMap::new();
         let raw_evt = RawKvEvent::BlockRemoved {
             block_hashes: vec![BlockHashValue::Unsigned(123), BlockHashValue::Signed(456)],
             medium: None,
         };
-        let out = convert_event(raw_evt, 7, kv_block_size, 0, &Arc::new(AtomicU32::new(0)));
+        let out = convert_event(
+            raw_evt,
+            7,
+            kv_block_size,
+            0,
+            &Arc::new(AtomicU32::new(0)),
+            &mut expanded_block_hashes,
+        );
 
         assert!(matches!(out.data, KvCacheEventData::Removed(_)));
     }
@@ -1178,9 +1414,50 @@ mod test_event_processing {
     #[test]
     fn test_convert_event_all_blocks_cleared() {
         let kv_block_size = 4;
+        let mut expanded_block_hashes = HashMap::new();
         let raw_evt = RawKvEvent::AllBlocksCleared;
-        let out = convert_event(raw_evt, 1, kv_block_size, 0, &Arc::new(AtomicU32::new(0)));
+        let out = convert_event(
+            raw_evt,
+            1,
+            kv_block_size,
+            0,
+            &Arc::new(AtomicU32::new(0)),
+            &mut expanded_block_hashes,
+        );
         assert!(matches!(out.data, KvCacheEventData::Cleared));
+    }
+
+    #[test]
+    fn test_convert_event_expands_larger_blocks() {
+        let kv_block_size = 4;
+        let mut expanded_block_hashes = HashMap::new();
+        let warning_count = Arc::new(AtomicU32::new(0));
+
+        let raw_evt = RawKvEvent::BlockStored {
+            block_hashes: vec![BlockHashValue::Unsigned(1001)],
+            parent_block_hash: None,
+            token_ids: vec![1, 2, 3, 4, 5, 6, 7, 8],
+            block_size: 8,
+            lora_id: Some(0),
+            medium: Some("CPU".to_string()),
+            lora_name: None,
+            block_mm_infos: None,
+        };
+
+        let out = convert_event(
+            raw_evt,
+            42,
+            kv_block_size,
+            0,
+            &warning_count,
+            &mut expanded_block_hashes,
+        );
+        let KvCacheEventData::Stored(store) = out.data else {
+            panic!("expected stored event");
+        };
+        assert_eq!(store.blocks.len(), 2);
+        assert_eq!(store.blocks[0].medium.as_deref(), Some("CPU"));
+        assert!(expanded_block_hashes.contains_key(&1001));
     }
 }
 
