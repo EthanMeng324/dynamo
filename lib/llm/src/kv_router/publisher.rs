@@ -657,6 +657,8 @@ fn convert_event(
                         medium: medium.clone(),
                         original_hash: None,
                         sub_idx: Some(sub_idx),
+                        parent_raw: original_parent_raw,
+                        parent_hash,
                     });
                 }
 
@@ -722,6 +724,8 @@ fn convert_event(
                         medium: medium.clone(),
                         original_hash: Some(*original_hash),
                         sub_idx: Some(this_sub_idx),
+                        parent_raw: original_parent_raw,
+                        parent_hash,
                     });
                 }
 
@@ -913,6 +917,8 @@ pub fn create_stored_block_from_parts(
         medium,
         original_hash: Some(block_hash),
         sub_idx: Some(0),
+        parent_raw: None,
+        parent_hash: None,
     }
 }
 

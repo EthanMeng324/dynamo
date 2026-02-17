@@ -143,6 +143,8 @@ impl KvManager {
                         medium: None,
                         original_hash: None,
                         sub_idx: None,
+                        parent_raw: None,
+                        parent_hash: None,
                     })
                     .collect(),
             })

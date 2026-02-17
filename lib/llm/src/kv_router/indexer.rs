@@ -181,9 +181,11 @@ struct RadixBlock {
     /// This is used as the canonical block hash for traversal and dump order.
     block_hash: Option<ExternalSequenceBlockHash>,
     /// Diagnostic fields recorded from the first stored event for this node.
-    debug_tokens_hash: Option<LocalBlockHash>,
     debug_original_hash: Option<u64>,
     debug_sub_idx: Option<u32>,
+    debug_parent_raw: Option<u64>,
+    debug_parent_hash: Option<ExternalSequenceBlockHash>,
+    debug_medium: Option<String>,
     /// A buffer of times that this block was last traversed
     recent_uses: VecDeque<Instant>,
 }
@@ -199,9 +201,11 @@ impl RadixBlock {
             children: HashMap::new(),
             workers: HashMap::new(),
             block_hash: None,
-            debug_tokens_hash: None,
             debug_original_hash: None,
             debug_sub_idx: None,
+            debug_parent_raw: None,
+            debug_parent_hash: None,
+            debug_medium: None,
             recent_uses: VecDeque::new(),
         }
     }
@@ -216,9 +220,11 @@ impl RadixBlock {
             children: HashMap::new(),
             workers: HashMap::new(),
             block_hash: Some(block_hash),
-            debug_tokens_hash: None,
             debug_original_hash: None,
             debug_sub_idx: None,
+            debug_parent_raw: None,
+            debug_parent_hash: None,
+            debug_medium: None,
             recent_uses: VecDeque::new(),
         }
     }
@@ -434,8 +440,12 @@ impl RadixTree {
                                 tracing::warn!(
                                     expected_block_hash = ?block_data.block_hash,
                                     actual_block_hash = ?block_borrow.block_hash,
-                                    expected_tokens_hash = ?block_data.tokens_hash,
-                                    actual_tokens_hash = ?block_borrow.debug_tokens_hash,
+                                    expected_parent_raw = ?block_data.parent_raw,
+                                    actual_parent_raw = ?block_borrow.debug_parent_raw,
+                                    expected_parent_hash = ?block_data.parent_hash,
+                                    actual_parent_hash = ?block_borrow.debug_parent_hash,
+                                    expected_medium = ?block_data.medium,
+                                    actual_medium = ?block_borrow.debug_medium,
                                     expected_original_hash = ?block_data.original_hash,
                                     actual_original_hash = ?block_borrow.debug_original_hash,
                                     expected_sub_idx = ?block_data.sub_idx,
@@ -483,10 +493,12 @@ impl RadixTree {
                                 return Err(KvCacheEventError::InvalidBlockSequence);
                             }
                         };
-                        if child_mut.debug_tokens_hash.is_none() {
-                            child_mut.debug_tokens_hash = Some(block_data.tokens_hash);
+                        if child_mut.debug_parent_hash.is_none() {
                             child_mut.debug_original_hash = block_data.original_hash;
                             child_mut.debug_sub_idx = block_data.sub_idx;
+                            child_mut.debug_parent_raw = block_data.parent_raw;
+                            child_mut.debug_parent_hash = block_data.parent_hash;
+                            child_mut.debug_medium = block_data.medium.clone();
                         }
 
                         // add/update our worker's info for this block, tracking both GPU and CPU presence.
@@ -682,6 +694,8 @@ impl RadixTree {
                                     medium: tier_medium.clone(),
                                     original_hash: None,
                                     sub_idx: None,
+                                    parent_raw: None,
+                                    parent_hash: None,
                                 }],
                             }),
                             dp_rank: worker_id.dp_rank,
@@ -1162,6 +1176,8 @@ impl KvIndexer {
                                     medium: None,
                                     original_hash: None,
                                     sub_idx: None,
+                                    parent_raw: None,
+                                    parent_hash: None,
                                 }).collect(),
                             });
 
@@ -1893,6 +1909,8 @@ impl KvIndexerSharded {
                                         medium: None,
                                         original_hash: None,
                                         sub_idx: None,
+                                        parent_raw: None,
+                                        parent_hash: None,
                                     }).collect(),
                                 });
 
