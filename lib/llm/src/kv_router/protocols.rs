@@ -409,6 +409,12 @@ pub struct KvCacheStoredBlockData {
     /// The storage medium for this block (e.g., "GPU", "CPU_TIER1", "CPU_TIER2")
     #[serde(default)]
     pub medium: Option<String>,
+    /// Diagnostic: upstream original block hash before splitting.
+    #[serde(default)]
+    pub original_hash: Option<u64>,
+    /// Diagnostic: sub-block index inside an upstream original block.
+    #[serde(default)]
+    pub sub_idx: Option<u32>,
 }
 
 /// Represents the data associated with a removed cache event.

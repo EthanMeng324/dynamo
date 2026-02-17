@@ -423,6 +423,9 @@ impl RadixTree {
                                 tracing::warn!(
                                     expected = ?block_data.block_hash,
                                     actual = ?block.borrow().block_hash,
+                                    tokens_hash = ?block_data.tokens_hash,
+                                    original_hash = ?block_data.original_hash,
+                                    sub_idx = ?block_data.sub_idx,
                                     "block_hash mismatch: sequence hashes should be uniform across workers"
                                 );
                             }
@@ -657,6 +660,8 @@ impl RadixTree {
                                     mm_extra_info: None,
                                     tokens_hash,
                                     medium: tier_medium.clone(),
+                                    original_hash: None,
+                                    sub_idx: None,
                                 }],
                             }),
                             dp_rank: worker_id.dp_rank,
@@ -1135,6 +1140,8 @@ impl KvIndexer {
                                     block_hash: ExternalSequenceBlockHash(*sequence_hash),
                                     mm_extra_info: None,
                                     medium: None,
+                                    original_hash: None,
+                                    sub_idx: None,
                                 }).collect(),
                             });
 
@@ -1864,6 +1871,8 @@ impl KvIndexerSharded {
                                         block_hash: ExternalSequenceBlockHash(*sequence_hash),
                                         mm_extra_info: None,
                                         medium: None,
+                                        original_hash: None,
+                                        sub_idx: None,
                                     }).collect(),
                                 });
 

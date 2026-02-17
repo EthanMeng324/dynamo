@@ -21,6 +21,7 @@ export ETCD_ENDPOINTS="${HEAD_NODE_IP}:2379"
 python -m dynamo.frontend --router-mode kv-strata --router-reset-states
 
 sudo -E env CUDA_VISIBLE_DEVICES=0 \
+PYTHONHASHSEED=0 \
 LMCACHE_CONFIG_FILE=lmcache.yaml \
 ./venv/bin/python -m dynamo.vllm \
   --model Qwen/Qwen2.5-7B-Instruct \
@@ -29,6 +30,7 @@ LMCACHE_CONFIG_FILE=lmcache.yaml \
   --kv-events-config '{"enable_kv_cache_events":"True","publisher":"zmq","topic":"kv-events"}'
 #### s6:
 sudo -E env CUDA_VISIBLE_DEVICES=0 \
+PYTHONHASHSEED=0 \
 LMCACHE_CONFIG_FILE=lmcache.yaml \
 ./venv/bin/python -m dynamo.vllm \
   --model Qwen/Qwen2.5-7B-Instruct \

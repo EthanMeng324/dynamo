@@ -645,6 +645,7 @@ fn convert_event(
                         kv_block_size,
                         block_mm_infos.as_deref(),
                     );
+                    let sub_idx = blocks.len() as u32;
                     let block_hash =
                         derive_expanded_block_hash(event_id ^ 0x5f37_59df_u64, blocks.len(), tokens_hash);
                     blocks.push(KvCacheStoredBlockData {
@@ -654,6 +655,8 @@ fn convert_event(
                             .and_then(|mut infos| infos.pop())
                             .and_then(|opt| opt),
                         medium: medium.clone(),
+                        original_hash: None,
+                        sub_idx: Some(sub_idx),
                     });
                 }
 
@@ -708,6 +711,7 @@ fn convert_event(
                         kv_block_size,
                         block_mm_infos.as_deref(),
                     );
+                    let this_sub_idx = sub_idx as u32;
                     let block_hash = derive_expanded_block_hash(*original_hash, sub_idx, tokens_hash);
                     sub_idx += 1;
                     expanded_hashes_for_block.push(block_hash.0);
@@ -716,6 +720,8 @@ fn convert_event(
                         tokens_hash,
                         mm_extra_info: mm_extra_info.clone(),
                         medium: medium.clone(),
+                        original_hash: Some(*original_hash),
+                        sub_idx: Some(this_sub_idx),
                     });
                 }
 
@@ -905,6 +911,8 @@ pub fn create_stored_block_from_parts(
         tokens_hash,
         mm_extra_info,
         medium,
+        original_hash: Some(block_hash),
+        sub_idx: Some(0),
     }
 }
 

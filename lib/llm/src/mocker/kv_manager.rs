@@ -141,6 +141,8 @@ impl KvManager {
                         tokens_hash: LocalBlockHash(*local_hash),
                         mm_extra_info: None,
                         medium: None,
+                        original_hash: None,
+                        sub_idx: None,
                     })
                     .collect(),
             })
