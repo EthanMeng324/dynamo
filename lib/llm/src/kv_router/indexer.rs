@@ -180,6 +180,10 @@ struct RadixBlock {
     /// The external sequence block hash for this block (None for root).
     /// This is used as the canonical block hash for traversal and dump order.
     block_hash: Option<ExternalSequenceBlockHash>,
+    /// Diagnostic fields recorded from the first stored event for this node.
+    debug_tokens_hash: Option<LocalBlockHash>,
+    debug_original_hash: Option<u64>,
+    debug_sub_idx: Option<u32>,
     /// A buffer of times that this block was last traversed
     recent_uses: VecDeque<Instant>,
 }
@@ -195,6 +199,9 @@ impl RadixBlock {
             children: HashMap::new(),
             workers: HashMap::new(),
             block_hash: None,
+            debug_tokens_hash: None,
+            debug_original_hash: None,
+            debug_sub_idx: None,
             recent_uses: VecDeque::new(),
         }
     }
@@ -209,6 +216,9 @@ impl RadixBlock {
             children: HashMap::new(),
             workers: HashMap::new(),
             block_hash: Some(block_hash),
+            debug_tokens_hash: None,
+            debug_original_hash: None,
+            debug_sub_idx: None,
             recent_uses: VecDeque::new(),
         }
     }
@@ -419,16 +429,21 @@ impl RadixTree {
                     let child = match parent_mut.children.get(&block_data.tokens_hash) {
                         Some(block) => {
                             // Verify our simplifying assumption: block_hash is uniform across workers
-                            if block.borrow().block_hash != Some(block_data.block_hash) {
+                            let block_borrow = block.borrow();
+                            if block_borrow.block_hash != Some(block_data.block_hash) {
                                 tracing::warn!(
-                                    expected = ?block_data.block_hash,
-                                    actual = ?block.borrow().block_hash,
-                                    tokens_hash = ?block_data.tokens_hash,
-                                    original_hash = ?block_data.original_hash,
-                                    sub_idx = ?block_data.sub_idx,
+                                    expected_block_hash = ?block_data.block_hash,
+                                    actual_block_hash = ?block_borrow.block_hash,
+                                    expected_tokens_hash = ?block_data.tokens_hash,
+                                    actual_tokens_hash = ?block_borrow.debug_tokens_hash,
+                                    expected_original_hash = ?block_data.original_hash,
+                                    actual_original_hash = ?block_borrow.debug_original_hash,
+                                    expected_sub_idx = ?block_data.sub_idx,
+                                    actual_sub_idx = ?block_borrow.debug_sub_idx,
                                     "block_hash mismatch: sequence hashes should be uniform across workers"
                                 );
                             }
+                            drop(block_borrow);
                             block.clone()
                         }
                         None => {
@@ -468,6 +483,11 @@ impl RadixTree {
                                 return Err(KvCacheEventError::InvalidBlockSequence);
                             }
                         };
+                        if child_mut.debug_tokens_hash.is_none() {
+                            child_mut.debug_tokens_hash = Some(block_data.tokens_hash);
+                            child_mut.debug_original_hash = block_data.original_hash;
+                            child_mut.debug_sub_idx = block_data.sub_idx;
+                        }
 
                         // add/update our worker's info for this block, tracking both GPU and CPU presence.
                         // In kv mode (!use_strata_routing), only store GPU blocks (original Dynamo behavior).
