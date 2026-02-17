@@ -2,7 +2,7 @@ BASE=$(conda info --base)
 export LD_LIBRARY_PATH="$BASE/lib:$LD_LIBRARY_PATH"
 
 ### Single Node:
-python -m dynamo.frontend --router-mode kv
+python -m dynamo.frontend --router-mode kv --router-reset-states
 
 CUDA_VISIBLE_DEVICES=0 \
 LMCACHE_CONFIG_FILE=lmcache.yaml \
@@ -18,7 +18,7 @@ export HEAD_NODE_IP="192.168.3.67"
 export NATS_SERVER="nats://${HEAD_NODE_IP}:4222"
 export ETCD_ENDPOINTS="${HEAD_NODE_IP}:2379"
 
-python -m dynamo.frontend --router-mode kv
+python -m dynamo.frontend --router-mode kv-strata --router-reset-states
 
 sudo -E env CUDA_VISIBLE_DEVICES=0 \
 LMCACHE_CONFIG_FILE=lmcache.yaml \

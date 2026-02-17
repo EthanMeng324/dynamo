@@ -582,7 +582,7 @@ fn convert_event(
             parent_block_hash,
             token_ids,
             block_size,
-            lora_id,
+            lora_id: _lora_id,
             block_mm_infos,
             medium,
             ..
@@ -590,12 +590,12 @@ fn convert_event(
             let num_blocks = block_hashes.len();
             let token_ids_len = token_ids.len();
             let original_parent_raw = parent_block_hash.map(BlockHashValue::into_u64);
-            let tokens_per_event_block = if num_blocks > 0 && token_ids_len % num_blocks == 0 {
-                Some(token_ids_len / num_blocks)
+            let block_token_sizes = compute_block_token_sizes(num_blocks, block_size, token_ids_len);
+            let tokens_per_event_block = if num_blocks > 0 {
+                block_token_sizes[0]
             } else {
-                None
-            }
-            .unwrap_or(block_size);
+                block_size
+            };
 
             let original_hashes: Vec<u64> = block_hashes
                 .into_iter()
@@ -622,21 +622,31 @@ fn convert_event(
             // Upstream occasionally provides token_ids with empty block_hashes.
             // Recover by deriving stable per-chunk hashes from token content so events stay usable.
             if original_hashes.is_empty() && !token_ids.is_empty() {
+                tracing::warn!(
+                    "Entering token-only fallback: event_id={}, dp_rank={}, raw_num_blocks={}, raw_token_ids_len={}, raw_block_size={}, medium={:?}, parent_raw={:?}",
+                    event_id,
+                    dp_rank,
+                    num_blocks,
+                    token_ids_len,
+                    block_size,
+                    medium,
+                    original_parent_raw,
+                );
                 let mut blocks = Vec::new();
                 let kv_chunk = kv_block_size as usize;
-                for (chunk_idx, chunk_tokens) in token_ids.chunks(kv_chunk).enumerate() {
+                for chunk_tokens in token_ids.chunks(kv_chunk) {
                     let block_mm_infos = block_mm_infos
                         .as_deref()
                         .and_then(|infos| infos.first())
                         .and_then(|opt| opt.clone())
                         .map(|info| vec![Some(info)]);
-                    let tokens_hash =
-                        compute_block_hash_for_seq(chunk_tokens, kv_block_size, block_mm_infos.as_deref())[0];
-                    let block_hash = derive_expanded_block_hash(
-                        event_id ^ 0x5f37_59df_u64,
-                        chunk_idx,
-                        tokens_hash,
+                    let tokens_hash = compute_local_block_hash_with_optional_padding(
+                        chunk_tokens,
+                        kv_block_size,
+                        block_mm_infos.as_deref(),
                     );
+                    let block_hash =
+                        derive_expanded_block_hash(event_id ^ 0x5f37_59df_u64, blocks.len(), tokens_hash);
                     blocks.push(KvCacheStoredBlockData {
                         block_hash,
                         tokens_hash,
@@ -668,103 +678,76 @@ fn convert_event(
                 };
             }
 
-            // Fast path: already aligned with kv_block_size
-            let (conversion_path, blocks) = if tokens_per_event_block == kv_block_size as usize {
-                let num_block_tokens = vec![kv_block_size as u64; num_blocks];
-                let blocks = create_stored_blocks(
-                    kv_block_size,
-                    &token_ids,
-                    &num_block_tokens,
-                    &original_hashes,
-                    lora_id.unwrap_or(0),
-                    warning_count,
-                    block_mm_infos.as_deref(),
-                    medium.clone(),
-                );
-                for hash in &original_hashes {
-                    expanded_block_hashes.insert(*hash, vec![*hash]);
-                }
-                ("aligned", blocks)
-            } else if tokens_per_event_block % kv_block_size as usize == 0 {
-                // Compatibility path: LMCache events may use larger logical blocks (e.g. 256).
-                // Split to kv_block_size chunks so radix matching remains consistent with router hashing.
-                let mut blocks = Vec::new();
-                let mut token_offset = 0usize;
-                let subblocks_per_block = tokens_per_event_block / kv_block_size as usize;
+            let mut blocks = Vec::new();
+            let mut token_offset = 0usize;
+            let mut geometry_mismatch = false;
+            for (block_idx, original_hash) in original_hashes.iter().enumerate() {
+                let mm_extra_info = block_mm_infos
+                    .as_deref()
+                    .and_then(|infos| infos.get(block_idx))
+                    .and_then(|opt| opt.clone());
+                let this_block_tokens = *block_token_sizes.get(block_idx).unwrap_or(&0);
+                let mut remaining = this_block_tokens;
+                let mut sub_idx = 0usize;
+                let mut expanded_hashes_for_block = Vec::new();
 
-                for (block_idx, original_hash) in original_hashes.iter().enumerate() {
-                    let mm_extra_info = block_mm_infos
-                        .as_deref()
-                        .and_then(|infos| infos.get(block_idx))
-                        .and_then(|opt| opt.clone());
-
-                    let mut expanded_hashes_for_block = Vec::with_capacity(subblocks_per_block);
-                    for sub_idx in 0..subblocks_per_block {
-                        let end = token_offset + kv_block_size as usize;
-                        if end > token_ids.len() {
-                            // Fallback: preserve chain semantics even when payload is shorter than expected.
-                            let fallback_hash = derive_expanded_block_hash(
-                                *original_hash,
-                                sub_idx,
-                                LocalBlockHash(*original_hash),
-                            );
-                            expanded_hashes_for_block.push(fallback_hash.0);
-                            blocks.push(KvCacheStoredBlockData {
-                                block_hash: fallback_hash,
-                                tokens_hash: LocalBlockHash(*original_hash),
-                                mm_extra_info: mm_extra_info.clone(),
-                                medium: medium.clone(),
-                            });
-                            continue;
-                        }
-                        let tokens = &token_ids[token_offset..end];
-                        token_offset = end;
-
-                        let block_mm_infos = mm_extra_info.as_ref().map(|info| vec![Some(info.clone())]);
-                        let tokens_hash =
-                            compute_block_hash_for_seq(tokens, kv_block_size, block_mm_infos.as_deref())[0];
-                        let derived_hash = derive_expanded_block_hash(*original_hash, sub_idx, tokens_hash);
-                        expanded_hashes_for_block.push(derived_hash.0);
-                        blocks.push(KvCacheStoredBlockData {
-                            block_hash: derived_hash,
-                            tokens_hash,
-                            mm_extra_info: mm_extra_info.clone(),
-                            medium: medium.clone(),
-                        });
+                while remaining > 0 {
+                    let take = remaining.min(kv_block_size as usize);
+                    let end = token_offset + take;
+                    if end > token_ids.len() {
+                        geometry_mismatch = true;
+                        break;
                     }
+                    let tokens = &token_ids[token_offset..end];
+                    token_offset = end;
+                    remaining -= take;
 
-                    if expanded_hashes_for_block.is_empty() {
-                        expanded_block_hashes.remove(original_hash);
-                    } else {
-                        expanded_block_hashes.insert(*original_hash, expanded_hashes_for_block);
-                    }
-                }
-
-                ("split_large_block", blocks)
-            } else {
-                // Geometry mismatch fallback: keep one block per incoming hash so parent/child chain remains valid.
-                if warning_count.fetch_add(1, Ordering::Relaxed) < 10 {
-                    tracing::warn!(
-                        "KV BlockStored geometry mismatch; using fallback hashing (event_id={}, kv_block_size={}, event_block_size={}, inferred_tokens_per_block={}, num_blocks={}, token_ids_len={})",
-                        event_id,
+                    let block_mm_infos = mm_extra_info.as_ref().map(|info| vec![Some(info.clone())]);
+                    let tokens_hash = compute_local_block_hash_with_optional_padding(
+                        tokens,
                         kv_block_size,
-                        block_size,
-                        tokens_per_event_block,
-                        num_blocks,
-                        token_ids_len
+                        block_mm_infos.as_deref(),
                     );
-                }
-                let mut blocks = Vec::with_capacity(original_hashes.len());
-                for original_hash in &original_hashes {
-                    expanded_block_hashes.insert(*original_hash, vec![*original_hash]);
+                    let block_hash = derive_expanded_block_hash(*original_hash, sub_idx, tokens_hash);
+                    sub_idx += 1;
+                    expanded_hashes_for_block.push(block_hash.0);
                     blocks.push(KvCacheStoredBlockData {
-                        block_hash: ExternalSequenceBlockHash::from(*original_hash),
-                        tokens_hash: LocalBlockHash(*original_hash),
-                        mm_extra_info: None,
+                        block_hash,
+                        tokens_hash,
+                        mm_extra_info: mm_extra_info.clone(),
                         medium: medium.clone(),
                     });
                 }
-                ("geometry_mismatch_fallback", blocks)
+
+                if remaining > 0 {
+                    geometry_mismatch = true;
+                }
+                if expanded_hashes_for_block.is_empty() {
+                    expanded_block_hashes.remove(original_hash);
+                } else {
+                    expanded_block_hashes.insert(*original_hash, expanded_hashes_for_block);
+                }
+            }
+            if token_offset < token_ids.len() {
+                geometry_mismatch = true;
+            }
+
+            if geometry_mismatch && warning_count.fetch_add(1, Ordering::Relaxed) < 10 {
+                tracing::warn!(
+                    "KV BlockStored geometry mismatch while splitting (event_id={}, kv_block_size={}, event_block_size={}, first_block_tokens={}, num_blocks={}, token_ids_len={}, consumed_tokens={})",
+                    event_id,
+                    kv_block_size,
+                    block_size,
+                    tokens_per_event_block,
+                    num_blocks,
+                    token_ids_len,
+                    token_offset
+                );
+            }
+            let conversion_path = if block_size == kv_block_size as usize {
+                "aligned"
+            } else {
+                "split_by_actual_token_len"
             };
 
             if blocks.is_empty() {
@@ -837,6 +820,50 @@ fn convert_event(
             }
         }
     }
+}
+
+fn compute_block_token_sizes(num_blocks: usize, block_size: usize, token_ids_len: usize) -> Vec<usize> {
+    if num_blocks == 0 {
+        return Vec::new();
+    }
+    if block_size == 0 {
+        let mut sizes = vec![0; num_blocks];
+        sizes[0] = token_ids_len;
+        return sizes;
+    }
+
+    let mut sizes = vec![0; num_blocks];
+    let mut remaining = token_ids_len;
+    for (idx, size) in sizes.iter_mut().enumerate() {
+        if remaining == 0 {
+            *size = 0;
+            continue;
+        }
+        if idx == num_blocks - 1 {
+            *size = remaining.min(block_size);
+            remaining = remaining.saturating_sub(*size);
+        } else {
+            let take = remaining.min(block_size);
+            *size = take;
+            remaining -= take;
+        }
+    }
+    sizes
+}
+
+fn compute_local_block_hash_with_optional_padding(
+    tokens: &[u32],
+    kv_block_size: u32,
+    block_mm_infos: Option<&[Option<BlockExtraInfo>]>,
+) -> LocalBlockHash {
+    if tokens.len() == kv_block_size as usize {
+        return compute_block_hash_for_seq(tokens, kv_block_size, block_mm_infos)[0];
+    }
+
+    let mut padded = Vec::with_capacity(kv_block_size as usize);
+    padded.extend_from_slice(tokens);
+    padded.resize(kv_block_size as usize, 0);
+    compute_block_hash_for_seq(&padded, kv_block_size, block_mm_infos)[0]
 }
 
 fn derive_expanded_block_hash(
