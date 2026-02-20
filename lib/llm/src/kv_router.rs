@@ -282,6 +282,7 @@ impl Indexer {
             Indexer::None => Ok(OverlapScores {
                 gpu_scores: HashMap::new(),
                 cpu_scores: HashMap::new(),
+                gpu_and_cpu_scores: HashMap::new(),
                 scores: HashMap::new(),
                 frequencies: Vec::new(),
                 tree_sizes: HashMap::new(),

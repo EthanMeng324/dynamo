@@ -908,6 +908,9 @@ pub struct OverlapScores {
     pub gpu_scores: HashMap<WorkerWithDpRank, u32>,
     // map of worker (with dp_rank) to CPU match count
     pub cpu_scores: HashMap<WorkerWithDpRank, u32>,
+    // map of worker (with dp_rank) to blocks present in both GPU and CPU tiers
+    #[serde(default)]
+    pub gpu_and_cpu_scores: HashMap<WorkerWithDpRank, u32>,
     // List of frequencies that the blocks have been accessed. Entries with value 0 are omitted.
     pub frequencies: Vec<usize>,
     // Map of worker to their tree size (number of blocks in the tree for that worker)
@@ -933,6 +936,7 @@ impl OverlapScores {
         Self {
             gpu_scores: HashMap::new(),
             cpu_scores: HashMap::new(),
+            gpu_and_cpu_scores: HashMap::new(),
             frequencies: Vec::with_capacity(32),
             tree_sizes: HashMap::new(),
             scores: HashMap::new(),
@@ -952,8 +956,11 @@ impl OverlapScores {
         for (worker, block_info) in worker_blocks {
             // kv mode: only count GPU.
             // kv-strata: CPU score represents GPU-uncovered CPU matches.
-            let count_gpu = block_info.gpu_block_hash.is_some();
-            let count_cpu = use_strata_routing && block_info.cpu_block_hash.is_some() && !count_gpu;
+            let has_gpu = block_info.gpu_block_hash.is_some();
+            let has_cpu = block_info.cpu_block_hash.is_some();
+            let count_gpu = has_gpu;
+            let count_cpu = use_strata_routing && has_cpu && !has_gpu;
+            let count_both = use_strata_routing && has_gpu && has_cpu;
 
             if count_gpu {
                 let score = self.gpu_scores.entry(*worker).or_insert(0);
@@ -961,6 +968,10 @@ impl OverlapScores {
             }
             if count_cpu {
                 let score = self.cpu_scores.entry(*worker).or_insert(0);
+                *score += 1;
+            }
+            if count_both {
+                let score = self.gpu_and_cpu_scores.entry(*worker).or_insert(0);
                 *score += 1;
             }
             if !(count_gpu || count_cpu) {
