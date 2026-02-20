@@ -456,7 +456,7 @@ pub async fn start_zmq_listener(
     #[allow(unused_assignments)]
     let mut exit_reason = "unknown";
     let mut messages_processed = 0u64;
-    let mut expanded_block_hashes: HashMap<u64, Vec<u64>> = HashMap::new();
+    let mut expanded_block_hashes: HashMap<(u64, Option<String>), Vec<u64>> = HashMap::new();
 
     'main: loop {
         tokio::select! {
@@ -574,7 +574,7 @@ fn convert_event(
     kv_block_size: u32,
     dp_rank: u32,
     warning_count: &Arc<AtomicU32>,
-    expanded_block_hashes: &mut HashMap<u64, Vec<u64>>,
+    expanded_block_hashes: &mut HashMap<(u64, Option<String>), Vec<u64>>,
 ) -> KvCacheEvent {
     match raw {
         RawKvEvent::BlockStored {
@@ -587,6 +587,7 @@ fn convert_event(
             medium,
             ..
         } => {
+            let medium_key = normalize_medium_key(medium.as_deref());
             let num_blocks = block_hashes.len();
             let token_ids_len = token_ids.len();
             let original_parent_raw = parent_block_hash.map(BlockHashValue::into_i64);
@@ -612,9 +613,15 @@ fn convert_event(
                     }
                 })
                 .map(|parent| {
-                    expanded_block_hashes
-                        .get(&parent.0)
-                        .and_then(|expanded| expanded.last().copied())
+                    let specific = expanded_block_hashes
+                        .get(&(parent.0, medium_key.clone()))
+                        .and_then(|expanded| expanded.last().copied());
+                    let fallback = expanded_block_hashes
+                        .iter()
+                        .find(|((raw_parent, _), _)| *raw_parent == parent.0)
+                        .and_then(|(_, expanded)| expanded.last().copied());
+                    specific
+                        .or(fallback)
                         .map(ExternalSequenceBlockHash::from)
                         .unwrap_or(parent)
                 });
@@ -669,9 +676,12 @@ fn convert_event(
                     geometry_mismatch = true;
                 }
                 if expanded_hashes_for_block.is_empty() {
-                    expanded_block_hashes.remove(original_hash_u64);
+                    expanded_block_hashes.remove(&(*original_hash_u64, medium_key.clone()));
                 } else {
-                    expanded_block_hashes.insert(*original_hash_u64, expanded_hashes_for_block);
+                    expanded_block_hashes.insert(
+                        (*original_hash_u64, medium_key.clone()),
+                        expanded_hashes_for_block,
+                    );
                 }
             }
             if token_offset < token_ids.len() {
@@ -740,6 +750,7 @@ fn convert_event(
         RawKvEvent::BlockRemoved {
             block_hashes, medium, ..
         } => {
+            let medium_key = normalize_medium_key(medium.as_deref());
             if medium.is_none() {
                 tracing::warn!(
                     "KV BlockRemoved missing medium: event_id={}, dp_rank={}, raw_num_blocks={}",
@@ -757,11 +768,45 @@ fn convert_event(
                 .collect();
             let mut hashes = Vec::new();
             for (block_hash_u64, _) in original_hashes {
-                if let Some(expanded_hashes) = expanded_block_hashes.remove(&block_hash_u64) {
+                if let Some(expanded_hashes) =
+                    expanded_block_hashes.remove(&(block_hash_u64, medium_key.clone()))
+                {
                     hashes.extend(expanded_hashes.into_iter().map(ExternalSequenceBlockHash::from));
-                } else {
-                    hashes.push(ExternalSequenceBlockHash::from(block_hash_u64));
+                    continue;
                 }
+
+                if medium_key.is_none() {
+                    let matching_keys: Vec<(u64, Option<String>)> = expanded_block_hashes
+                        .keys()
+                        .filter(|(raw_hash, _)| *raw_hash == block_hash_u64)
+                        .cloned()
+                        .collect();
+                    if !matching_keys.is_empty() {
+                        for key in matching_keys {
+                            if let Some(expanded_hashes) = expanded_block_hashes.remove(&key) {
+                                hashes.extend(
+                                    expanded_hashes
+                                        .into_iter()
+                                        .map(ExternalSequenceBlockHash::from),
+                                );
+                            }
+                        }
+                        continue;
+                    }
+                } else {
+                    let fallback_key = expanded_block_hashes
+                        .keys()
+                        .find(|(raw_hash, _)| *raw_hash == block_hash_u64)
+                        .cloned();
+                    if let Some(key) = fallback_key
+                        && let Some(expanded_hashes) = expanded_block_hashes.remove(&key)
+                    {
+                        hashes.extend(expanded_hashes.into_iter().map(ExternalSequenceBlockHash::from));
+                        continue;
+                    }
+                }
+
+                hashes.push(ExternalSequenceBlockHash::from(block_hash_u64));
             }
             KvCacheEvent {
                 event_id,
@@ -781,6 +826,10 @@ fn convert_event(
             }
         }
     }
+}
+
+fn normalize_medium_key(medium: Option<&str>) -> Option<String> {
+    medium.map(|m| m.to_ascii_uppercase())
 }
 
 fn compute_block_token_sizes(num_blocks: usize, block_size: usize, token_ids_len: usize) -> Vec<usize> {

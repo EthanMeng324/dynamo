@@ -645,11 +645,11 @@ pub async fn start_kv_router_background(
                                 );
                             } else if let KvCacheEventData::Removed(ref remove_data) = event.event.data {
                                 tracing::info!(
-                                    "NATS subscriber received Removed event: worker_id={}, event_id={}, {} blocks, first_block_hash={:?}",
+                                    "NATS subscriber received Removed event: worker_id={}, event_id={}, {} blocks, first_block_medium={:?}",
                                     event.worker_id,
                                     event.event.event_id,
                                     remove_data.block_hashes.len(),
-                                    remove_data.block_hashes.first(),
+                                    remove_data.medium.as_ref(),
                                 );
                             }
 
