@@ -349,7 +349,10 @@ impl KvEventPublisher {
                 .collect();
             let event = KvCacheEvent {
                 event_id,
-                data: KvCacheEventData::Removed(KvCacheRemoveData { block_hashes }),
+                data: KvCacheEventData::Removed(KvCacheRemoveData {
+                    block_hashes,
+                    medium: None,
+                }),
                 dp_rank,
             };
 

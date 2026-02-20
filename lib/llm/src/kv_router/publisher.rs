@@ -748,15 +748,19 @@ fn convert_event(
                     block_hashes.len(),
                 );
             }
-            let mut hashes = Vec::new();
-            for block_hash in block_hashes
+            // Keep conversion semantics aligned with BlockStored:
+            // preserve signed/unsigned interpretation for diagnostics while
+            // using u64 bit-pattern for lookup/removal mapping.
+            let original_hashes: Vec<(u64, i64)> = block_hashes
                 .into_iter()
-                .map(BlockHashValue::into_u64)
-            {
-                if let Some(expanded_hashes) = expanded_block_hashes.remove(&block_hash) {
+                .map(|h| (h.into_u64(), h.into_i64()))
+                .collect();
+            let mut hashes = Vec::new();
+            for (block_hash_u64, _) in original_hashes {
+                if let Some(expanded_hashes) = expanded_block_hashes.remove(&block_hash_u64) {
                     hashes.extend(expanded_hashes.into_iter().map(ExternalSequenceBlockHash::from));
                 } else {
-                    hashes.push(ExternalSequenceBlockHash::from(block_hash));
+                    hashes.push(ExternalSequenceBlockHash::from(block_hash_u64));
                 }
             }
             KvCacheEvent {
