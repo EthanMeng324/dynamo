@@ -27,7 +27,7 @@ LMCACHE_CONFIG_FILE=lmcache.yaml \
   --model Qwen/Qwen2.5-7B-Instruct \
   --gpu-memory-utilization 0.8 \
   --connector lmcache \
-  --kv-events-config '{"enable_kv_cache_events":"True","publisher":"zmq","topic":"kv-events"}'
+  --kv-events-config '{"enable_kv_cache_events":"True","publisher":"zmq","topic":"kv-events"}' \
   --block-size 256
 #### s6:
 sudo -E env CUDA_VISIBLE_DEVICES=0 \
@@ -147,7 +147,7 @@ uv pip install -e ".[vllm]"  # 或 [sglang], [trtllm]
 ## 7. 安装LMCache
 
 ```bash
-uv pip install -e ../LMCache --no-build-isolation
+uv pip install -e ./LMCache --no-build-isolation
 ```
 
 使用 `-e` 进行可编辑安装，这样修改代码后无需重新安装。

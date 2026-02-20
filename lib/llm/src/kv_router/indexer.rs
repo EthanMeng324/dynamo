@@ -552,6 +552,8 @@ impl RadixTree {
                 Ok(())
             }
             KvCacheEventData::Removed(remove) => {
+                let requested_blocks = remove.block_hashes.len();
+                let mut removed_blocks = 0usize;
                 let mut kv_cache_err: Option<KvCacheEventError> = None;
                 for block in remove.block_hashes {
                     // lookup block in worker's table
@@ -574,6 +576,7 @@ impl RadixTree {
                             continue;
                         }
                     };
+                    removed_blocks += 1;
 
                     let mut guard = entry.borrow_mut();
                     if let Some(info) = guard.workers.get_mut(&worker) {
@@ -598,6 +601,15 @@ impl RadixTree {
                     // remove the block from the worker's lookup table
                     worker_lookup.remove(&block);
                 }
+                tracing::info!(
+                    worker_id = worker.worker_id.to_string(),
+                    dp_rank = worker.dp_rank,
+                    id,
+                    requested_blocks,
+                    removed_blocks,
+                    missed_blocks = requested_blocks.saturating_sub(removed_blocks),
+                    "Processed remove event"
+                );
                 kv_cache_err.map_or(Ok(()), Err)
             }
             KvCacheEventData::Cleared => {
@@ -875,22 +887,24 @@ impl OverlapScores {
         I: IntoIterator<Item = (&'a WorkerWithDpRank, &'a WorkerBlockInfo)>,
     {
         for (worker, block_info) in worker_blocks {
-            // kv mode: only count GPU. kv-strata: count both (prefer GPU when both exist).
+            // kv mode: only count GPU.
+            // kv-strata: CPU score represents GPU-uncovered CPU matches.
             let count_gpu = block_info.gpu_block_hash.is_some();
-            let count_cpu = use_strata_routing && block_info.cpu_block_hash.is_some()
-                && block_info.gpu_block_hash.is_none();
+            let count_cpu = use_strata_routing && block_info.cpu_block_hash.is_some() && !count_gpu;
 
             if count_gpu {
                 let score = self.gpu_scores.entry(*worker).or_insert(0);
                 *score += 1;
-            } else if count_cpu {
+            }
+            if count_cpu {
                 let score = self.cpu_scores.entry(*worker).or_insert(0);
                 *score += 1;
-            } else {
+            }
+            if !(count_gpu || count_cpu) {
                 continue;
             }
 
-            // Total score for overlap/cost calculation
+            // Total score for overlap/cost calculation (count each matched block once).
             let total_score = self.scores.entry(*worker).or_insert(0);
             *total_score += 1;
         }

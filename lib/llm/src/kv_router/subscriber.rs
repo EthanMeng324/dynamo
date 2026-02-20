@@ -643,6 +643,14 @@ pub async fn start_kv_router_background(
                                     store_data.blocks.len(),
                                     store_data.blocks.first().and_then(|b| b.medium.as_ref())
                                 );
+                            } else if let KvCacheEventData::Removed(ref remove_data) = event.event.data {
+                                tracing::info!(
+                                    "NATS subscriber received Removed event: worker_id={}, event_id={}, {} blocks, first_block_hash={:?}",
+                                    event.worker_id,
+                                    event.event.event_id,
+                                    remove_data.block_hashes.len(),
+                                    remove_data.block_hashes.first(),
+                                );
                             }
 
                             // Forward the RouterEvent to the indexer
