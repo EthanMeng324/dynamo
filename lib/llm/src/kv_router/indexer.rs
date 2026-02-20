@@ -181,9 +181,9 @@ struct RadixBlock {
     /// This is used as the canonical block hash for traversal and dump order.
     block_hash: Option<ExternalSequenceBlockHash>,
     /// Diagnostic fields recorded from the first stored event for this node.
-    debug_original_hash: Option<u64>,
+    debug_original_hash: Option<i64>,
     debug_sub_idx: Option<u32>,
-    debug_parent_raw: Option<u64>,
+    debug_parent_raw: Option<i64>,
     debug_parent_hash: Option<ExternalSequenceBlockHash>,
     debug_medium: Option<String>,
     /// A buffer of times that this block was last traversed
@@ -436,7 +436,19 @@ impl RadixTree {
                         Some(block) => {
                             // Verify our simplifying assumption: block_hash is uniform across workers
                             let block_borrow = block.borrow();
-                            if block_borrow.block_hash != Some(block_data.block_hash) {
+                            let expected_is_gpu = block_data
+                                .medium
+                                .as_deref()
+                                .map(|m| m.eq_ignore_ascii_case("GPU"))
+                                .unwrap_or(true);
+                            let actual_is_gpu = block_borrow
+                                .debug_medium
+                                .as_deref()
+                                .map(|m| m.eq_ignore_ascii_case("GPU"))
+                                .unwrap_or(true);
+                            if expected_is_gpu == actual_is_gpu
+                                && block_borrow.block_hash != Some(block_data.block_hash)
+                            {
                                 tracing::warn!(
                                     expected_block_hash = ?block_data.block_hash,
                                     actual_block_hash = ?block_borrow.block_hash,

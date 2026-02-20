@@ -18,7 +18,7 @@ export HEAD_NODE_IP="192.168.3.67"
 export NATS_SERVER="nats://${HEAD_NODE_IP}:4222"
 export ETCD_ENDPOINTS="${HEAD_NODE_IP}:2379"
 
-python -m dynamo.frontend --router-mode kv-strata --router-reset-states
+python -m dynamo.frontend --router-mode kv-strata --router-reset-states --kv-cache-block-size 256
 
 sudo -E env CUDA_VISIBLE_DEVICES=0 \
 PYTHONHASHSEED=0 \
@@ -28,6 +28,7 @@ LMCACHE_CONFIG_FILE=lmcache.yaml \
   --gpu-memory-utilization 0.8 \
   --connector lmcache \
   --kv-events-config '{"enable_kv_cache_events":"True","publisher":"zmq","topic":"kv-events"}'
+  --block-size 256
 #### s6:
 sudo -E env CUDA_VISIBLE_DEVICES=0 \
 PYTHONHASHSEED=0 \
@@ -37,6 +38,7 @@ LMCACHE_CONFIG_FILE=lmcache.yaml \
   --gpu-memory-utilization 0.8 \
   --connector lmcache \
   --kv-events-config '{"enable_kv_cache_events":"True","publisher":"zmq","topic":"kv-events"}'
+  --block-size 256
 
 curl http://localhost:8000/v1/completions \
 -H "Content-Type: application/json" \

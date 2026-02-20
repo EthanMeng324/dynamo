@@ -411,13 +411,13 @@ pub struct KvCacheStoredBlockData {
     pub medium: Option<String>,
     /// Diagnostic: upstream original block hash before splitting.
     #[serde(default)]
-    pub original_hash: Option<u64>,
+    pub original_hash: Option<i64>,
     /// Diagnostic: sub-block index inside an upstream original block.
     #[serde(default)]
     pub sub_idx: Option<u32>,
     /// Diagnostic: raw upstream parent hash before any mapping.
     #[serde(default)]
-    pub parent_raw: Option<u64>,
+    pub parent_raw: Option<i64>,
     /// Diagnostic: mapped parent hash applied to this store event.
     #[serde(default)]
     pub parent_hash: Option<ExternalSequenceBlockHash>,

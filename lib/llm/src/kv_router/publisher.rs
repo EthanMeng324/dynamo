@@ -589,7 +589,7 @@ fn convert_event(
         } => {
             let num_blocks = block_hashes.len();
             let token_ids_len = token_ids.len();
-            let original_parent_raw = parent_block_hash.map(BlockHashValue::into_u64);
+            let original_parent_raw = parent_block_hash.map(BlockHashValue::into_i64);
             let block_token_sizes = compute_block_token_sizes(num_blocks, block_size, token_ids_len);
             let tokens_per_event_block = if num_blocks > 0 {
                 block_token_sizes[0]
@@ -597,9 +597,9 @@ fn convert_event(
                 block_size
             };
 
-            let original_hashes: Vec<u64> = block_hashes
+            let original_hashes: Vec<(u64, i64)> = block_hashes
                 .into_iter()
-                .map(BlockHashValue::into_u64)
+                .map(|h| (h.into_u64(), h.into_i64()))
                 .collect();
             // LMCache may use 0 as a root sentinel. Treat it as "no parent".
             let parent_hash = parent_block_hash
@@ -619,74 +619,10 @@ fn convert_event(
                         .unwrap_or(parent)
                 });
 
-            // Upstream occasionally provides token_ids with empty block_hashes.
-            // Recover by deriving stable per-chunk hashes from token content so events stay usable.
-            if original_hashes.is_empty() && !token_ids.is_empty() {
-                tracing::warn!(
-                    "Entering token-only fallback: event_id={}, dp_rank={}, raw_num_blocks={}, raw_token_ids_len={}, raw_block_size={}, medium={:?}, parent_raw={:?}",
-                    event_id,
-                    dp_rank,
-                    num_blocks,
-                    token_ids_len,
-                    block_size,
-                    medium,
-                    original_parent_raw,
-                );
-                let mut blocks = Vec::new();
-                let kv_chunk = kv_block_size as usize;
-                for chunk_tokens in token_ids.chunks(kv_chunk) {
-                    let block_mm_infos = block_mm_infos
-                        .as_deref()
-                        .and_then(|infos| infos.first())
-                        .and_then(|opt| opt.clone())
-                        .map(|info| vec![Some(info)]);
-                    let tokens_hash = compute_local_block_hash_with_optional_padding(
-                        chunk_tokens,
-                        kv_block_size,
-                        block_mm_infos.as_deref(),
-                    );
-                    let sub_idx = blocks.len() as u32;
-                    let block_hash =
-                        derive_expanded_block_hash(event_id ^ 0x5f37_59df_u64, blocks.len(), tokens_hash);
-                    blocks.push(KvCacheStoredBlockData {
-                        block_hash,
-                        tokens_hash,
-                        mm_extra_info: block_mm_infos
-                            .and_then(|mut infos| infos.pop())
-                            .and_then(|opt| opt),
-                        medium: medium.clone(),
-                        original_hash: None,
-                        sub_idx: Some(sub_idx),
-                        parent_raw: original_parent_raw,
-                        parent_hash,
-                    });
-                }
-
-                tracing::debug!(
-                    "KV BlockStored converted: event_id={}, dp_rank={}, path=token_only_fallback, raw_num_blocks={}, raw_token_ids_len={}, raw_block_size={}, inferred_tokens_per_event_block={}, out_blocks={}, medium={:?}, parent_raw={:?}, parent_mapped={:?}",
-                    event_id,
-                    dp_rank,
-                    num_blocks,
-                    token_ids_len,
-                    block_size,
-                    tokens_per_event_block,
-                    blocks.len(),
-                    medium,
-                    original_parent_raw,
-                    parent_hash,
-                );
-
-                return KvCacheEvent {
-                    event_id,
-                    data: KvCacheEventData::Stored(KvCacheStoreData { parent_hash, blocks }),
-                    dp_rank,
-                };
-            }
-
             let mut blocks = Vec::new();
             let mut token_offset = 0usize;
             let mut geometry_mismatch = false;
-            for (block_idx, original_hash) in original_hashes.iter().enumerate() {
+            for (block_idx, (original_hash_u64, original_hash_i64)) in original_hashes.iter().enumerate() {
                 let mm_extra_info = block_mm_infos
                     .as_deref()
                     .and_then(|infos| infos.get(block_idx))
@@ -714,7 +650,7 @@ fn convert_event(
                         block_mm_infos.as_deref(),
                     );
                     let this_sub_idx = sub_idx as u32;
-                    let block_hash = derive_expanded_block_hash(*original_hash, sub_idx, tokens_hash);
+                    let block_hash = derive_expanded_block_hash(*original_hash_u64, sub_idx, tokens_hash);
                     sub_idx += 1;
                     expanded_hashes_for_block.push(block_hash.0);
                     blocks.push(KvCacheStoredBlockData {
@@ -722,7 +658,7 @@ fn convert_event(
                         tokens_hash,
                         mm_extra_info: mm_extra_info.clone(),
                         medium: medium.clone(),
-                        original_hash: Some(*original_hash),
+                        original_hash: Some(*original_hash_i64),
                         sub_idx: Some(this_sub_idx),
                         parent_raw: original_parent_raw,
                         parent_hash,
@@ -733,9 +669,9 @@ fn convert_event(
                     geometry_mismatch = true;
                 }
                 if expanded_hashes_for_block.is_empty() {
-                    expanded_block_hashes.remove(original_hash);
+                    expanded_block_hashes.remove(original_hash_u64);
                 } else {
-                    expanded_block_hashes.insert(*original_hash, expanded_hashes_for_block);
+                    expanded_block_hashes.insert(*original_hash_u64, expanded_hashes_for_block);
                 }
             }
             if token_offset < token_ids.len() {
@@ -773,7 +709,7 @@ fn convert_event(
                     medium,
                     original_parent_raw,
                     parent_hash,
-                    original_hashes.first(),
+                    original_hashes.first().map(|(_, signed)| *signed),
                 );
             } else {
                 tracing::debug!(
@@ -915,7 +851,7 @@ pub fn create_stored_block_from_parts(
         tokens_hash,
         mm_extra_info,
         medium,
-        original_hash: Some(block_hash),
+        original_hash: Some(block_hash as i64),
         sub_idx: Some(0),
         parent_raw: None,
         parent_hash: None,
@@ -1007,6 +943,13 @@ impl BlockHashValue {
         match self {
             BlockHashValue::Signed(v) => v as u64,
             BlockHashValue::Unsigned(v) => v,
+        }
+    }
+
+    fn into_i64(self) -> i64 {
+        match self {
+            BlockHashValue::Signed(v) => v,
+            BlockHashValue::Unsigned(v) => v as i64,
         }
     }
 }
