@@ -793,19 +793,15 @@ fn convert_event(
                         }
                         continue;
                     }
-                } else {
-                    let fallback_key = expanded_block_hashes
-                        .keys()
-                        .find(|(raw_hash, _)| *raw_hash == block_hash_u64)
-                        .cloned();
-                    if let Some(key) = fallback_key
-                        && let Some(expanded_hashes) = expanded_block_hashes.remove(&key)
-                    {
-                        hashes.extend(expanded_hashes.into_iter().map(ExternalSequenceBlockHash::from));
-                        continue;
-                    }
                 }
 
+                tracing::warn!(
+                    "KV BlockRemoved mapping miss: event_id={}, dp_rank={}, raw_hash={}, medium={:?}",
+                    event_id,
+                    dp_rank,
+                    block_hash_u64,
+                    medium_key,
+                );
                 hashes.push(ExternalSequenceBlockHash::from(block_hash_u64));
             }
             KvCacheEvent {

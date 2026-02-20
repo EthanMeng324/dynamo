@@ -594,41 +594,84 @@ impl RadixTree {
                     };
 
                     let mut guard = entry.borrow_mut();
-                    if let Some(info) = guard.workers.get_mut(&worker) {
-                        // Clear the tier that matches this external block hash.
-                        match remove_tier {
-                            RemoveTier::Gpu => {
-                                if info.gpu_block_hash == Some(block) {
-                                    info.gpu_block_hash = None;
-                                }
-                            }
-                            RemoveTier::Cpu => {
-                                if info.cpu_block_hash == Some(block) {
-                                    info.cpu_block_hash = None;
-                                }
-                            }
-                            RemoveTier::Both => {
-                                if info.gpu_block_hash == Some(block) {
-                                    info.gpu_block_hash = None;
-                                }
-                                if info.cpu_block_hash == Some(block) {
-                                    info.cpu_block_hash = None;
-                                }
-                            }
+                    let Some(info) = guard.workers.get_mut(&worker) else {
+                        tracing::warn!(
+                            worker_id = worker.worker_id.to_string(),
+                            dp_rank = worker.dp_rank,
+                            id,
+                            block_hash = ?block,
+                            remove_medium = ?remove.medium,
+                            "Found block in lookup but worker has no tier info; skipping remove operation"
+                        );
+                        if kv_cache_err.is_none() {
+                            kv_cache_err = Some(KvCacheEventError::BlockNotFound);
                         }
+                        continue;
+                    };
 
-                        // Remove worker entry only if no tiers remain for this worker on this block.
-                        if info.gpu_block_hash.is_none() && info.cpu_block_hash.is_none() {
-                            guard.workers.remove(&worker);
+                    // Clear only the target tier; a remove is considered successful
+                    // only when that tier actually matched this block hash.
+                    let removed_target_tier = match remove_tier {
+                        RemoveTier::Gpu => {
+                            let matched = info.gpu_block_hash == Some(block);
+                            if matched {
+                                info.gpu_block_hash = None;
+                            }
+                            matched
                         }
+                        RemoveTier::Cpu => {
+                            let matched = info.cpu_block_hash == Some(block);
+                            if matched {
+                                info.cpu_block_hash = None;
+                            }
+                            matched
+                        }
+                        RemoveTier::Both => {
+                            let mut matched = false;
+                            if info.gpu_block_hash == Some(block) {
+                                info.gpu_block_hash = None;
+                                matched = true;
+                            }
+                            if info.cpu_block_hash == Some(block) {
+                                info.cpu_block_hash = None;
+                                matched = true;
+                            }
+                            matched
+                        }
+                    };
+
+                    if !removed_target_tier {
+                        tracing::warn!(
+                            worker_id = worker.worker_id.to_string(),
+                            dp_rank = worker.dp_rank,
+                            id,
+                            block_hash = ?block,
+                            remove_medium = ?remove.medium,
+                            gpu_block_hash = ?info.gpu_block_hash,
+                            cpu_block_hash = ?info.cpu_block_hash,
+                            "Remove tier mismatch: block exists but not in requested medium"
+                        );
+                        if kv_cache_err.is_none() {
+                            kv_cache_err = Some(KvCacheEventError::BlockNotFound);
+                        }
+                        continue;
+                    }
+
+                    // Remove worker entry only if no tiers remain for this worker on this block.
+                    let no_tiers_left =
+                        info.gpu_block_hash.is_none() && info.cpu_block_hash.is_none();
+                    if no_tiers_left {
+                        guard.workers.remove(&worker);
                     }
 
                     if guard.workers.is_empty() {
                         // if no workers are using this block, that is true for all children
                         guard.children.clear();
                     }
-                    // remove the block from the worker's lookup table
-                    worker_lookup.remove(&block);
+                    // Remove lookup entry only when this worker no longer has this block in any tier.
+                    if no_tiers_left {
+                        worker_lookup.remove(&block);
+                    }
                 }
                 kv_cache_err.map_or(Ok(()), Err)
             }
