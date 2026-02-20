@@ -552,8 +552,24 @@ impl RadixTree {
                 Ok(())
             }
             KvCacheEventData::Removed(remove) => {
-                let requested_blocks = remove.block_hashes.len();
-                let mut removed_blocks = 0usize;
+                enum RemoveTier {
+                    Gpu,
+                    Cpu,
+                    Both,
+                }
+                let remove_tier = match remove.medium.as_deref() {
+                    Some(m) if m.eq_ignore_ascii_case("GPU") => RemoveTier::Gpu,
+                    Some(_) => RemoveTier::Cpu,
+                    None => {
+                        tracing::warn!(
+                            worker_id = worker.worker_id.to_string(),
+                            dp_rank = worker.dp_rank,
+                            id,
+                            "Remove event missing medium; clearing both GPU and CPU tiers (legacy compatibility)"
+                        );
+                        RemoveTier::Both
+                    }
+                };
                 let mut kv_cache_err: Option<KvCacheEventError> = None;
                 for block in remove.block_hashes {
                     // lookup block in worker's table
@@ -576,16 +592,29 @@ impl RadixTree {
                             continue;
                         }
                     };
-                    removed_blocks += 1;
 
                     let mut guard = entry.borrow_mut();
                     if let Some(info) = guard.workers.get_mut(&worker) {
                         // Clear the tier that matches this external block hash.
-                        if info.gpu_block_hash == Some(block) {
-                            info.gpu_block_hash = None;
-                        }
-                        if info.cpu_block_hash == Some(block) {
-                            info.cpu_block_hash = None;
+                        match remove_tier {
+                            RemoveTier::Gpu => {
+                                if info.gpu_block_hash == Some(block) {
+                                    info.gpu_block_hash = None;
+                                }
+                            }
+                            RemoveTier::Cpu => {
+                                if info.cpu_block_hash == Some(block) {
+                                    info.cpu_block_hash = None;
+                                }
+                            }
+                            RemoveTier::Both => {
+                                if info.gpu_block_hash == Some(block) {
+                                    info.gpu_block_hash = None;
+                                }
+                                if info.cpu_block_hash == Some(block) {
+                                    info.cpu_block_hash = None;
+                                }
+                            }
                         }
 
                         // Remove worker entry only if no tiers remain for this worker on this block.
@@ -601,15 +630,6 @@ impl RadixTree {
                     // remove the block from the worker's lookup table
                     worker_lookup.remove(&block);
                 }
-                tracing::info!(
-                    worker_id = worker.worker_id.to_string(),
-                    dp_rank = worker.dp_rank,
-                    id,
-                    requested_blocks,
-                    removed_blocks,
-                    missed_blocks = requested_blocks.saturating_sub(removed_blocks),
-                    "Processed remove event"
-                );
                 kv_cache_err.map_or(Ok(()), Err)
             }
             KvCacheEventData::Cleared => {
@@ -1136,6 +1156,7 @@ impl KvIndexer {
                                         event_id: event_id_counter,
                                         data: KvCacheEventData::Removed(KvCacheRemoveData {
                                             block_hashes: vec![p.key],
+                                            medium: None,
                                         }),
                                         dp_rank: p.worker.dp_rank,
                                     }
@@ -1260,6 +1281,7 @@ impl KvIndexer {
                                         event_id: event_id_counter,
                                         data: KvCacheEventData::Removed(KvCacheRemoveData {
                                             block_hashes: vec![e.key],
+                                            medium: None,
                                         }),
                                         dp_rank: e.worker.dp_rank,
                                     }
@@ -1874,6 +1896,7 @@ impl KvIndexerSharded {
                                             event_id: event_id_counter,
                                             data: KvCacheEventData::Removed(KvCacheRemoveData {
                                                 block_hashes: vec![p.key],
+                                                medium: None,
                                             }),
                                             dp_rank: p.worker.dp_rank,
                                         }
@@ -2000,6 +2023,7 @@ impl KvIndexerSharded {
                                             event_id: event_id_counter,
                                             data: KvCacheEventData::Removed(KvCacheRemoveData {
                                                 block_hashes: vec![e.key],
+                                                medium: None,
                                             }),
                                             dp_rank: e.worker.dp_rank,
                                         }

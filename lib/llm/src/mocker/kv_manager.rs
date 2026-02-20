@@ -154,6 +154,7 @@ impl KvManager {
                     .into_iter()
                     .map(ExternalSequenceBlockHash)
                     .collect(),
+                medium: None,
             })
         };
 

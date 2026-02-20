@@ -737,8 +737,17 @@ fn convert_event(
                 dp_rank,
             }
         }
-        RawKvEvent::BlockRemoved { block_hashes, .. } => {
-            let raw_count = block_hashes.len();
+        RawKvEvent::BlockRemoved {
+            block_hashes, medium, ..
+        } => {
+            if medium.is_none() {
+                tracing::warn!(
+                    "KV BlockRemoved missing medium: event_id={}, dp_rank={}, raw_num_blocks={}",
+                    event_id,
+                    dp_rank,
+                    block_hashes.len(),
+                );
+            }
             let mut hashes = Vec::new();
             for block_hash in block_hashes
                 .into_iter()
@@ -750,18 +759,11 @@ fn convert_event(
                     hashes.push(ExternalSequenceBlockHash::from(block_hash));
                 }
             }
-            tracing::debug!(
-                "KV BlockRemoved converted: event_id={}, dp_rank={}, raw_num_blocks={}, out_blocks={}, first_block_hash={:?}",
-                event_id,
-                dp_rank,
-                raw_count,
-                hashes.len(),
-                hashes.first(),
-            );
             KvCacheEvent {
                 event_id,
                 data: KvCacheEventData::Removed(KvCacheRemoveData {
                     block_hashes: hashes,
+                    medium,
                 }),
                 dp_rank,
             }

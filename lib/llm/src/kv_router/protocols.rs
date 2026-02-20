@@ -428,6 +428,10 @@ pub struct KvCacheStoredBlockData {
 pub struct KvCacheRemoveData {
     /// A list of block hashes to remove.
     pub block_hashes: Vec<ExternalSequenceBlockHash>,
+    /// The storage medium for removed blocks (e.g., "GPU", "CPU_TIER1", "CPU_TIER2").
+    /// None indicates legacy payloads where medium was not provided.
+    #[serde(default)]
+    pub medium: Option<String>,
 }
 
 impl Serialize for LocalBlockHash {
