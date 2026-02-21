@@ -450,6 +450,9 @@ impl RadixTree {
                                 && block_borrow.block_hash != Some(block_data.block_hash)
                             {
                                 tracing::warn!(
+                                    worker_id = worker.worker_id.to_string(),
+                                    dp_rank = worker.dp_rank,
+                                    event_id = id,
                                     expected_block_hash = ?block_data.block_hash,
                                     actual_block_hash = ?block_borrow.block_hash,
                                     expected_parent_raw = ?block_data.parent_raw,

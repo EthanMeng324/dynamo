@@ -4,7 +4,7 @@
 # Basic configuration
 chunk_size: 256
 local_cpu: true
-max_local_cpu_size: 32.0  # 2GB CPU cache
+max_local_cpu_size: 60.0  # 2GB CPU cache
 # local_disk: "/tmp/lmcache_test"  # Disk cache directory - change this to your preferred path
 # max_local_disk_size: 10.0  # 10GB disk cache
 

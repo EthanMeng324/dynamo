@@ -590,6 +590,21 @@ fn convert_event(
             let medium_key = normalize_medium_key(medium.as_deref());
             let num_blocks = block_hashes.len();
             let token_ids_len = token_ids.len();
+            if medium
+                .as_deref()
+                .map(|m| m.eq_ignore_ascii_case("cpu"))
+                .unwrap_or(false)
+                && parent_block_hash.is_none()
+            {
+                tracing::warn!(
+                    "KV BlockStored received with CPU medium but missing parent_block_hash: event_id={}, dp_rank={}, raw_num_blocks={}, raw_token_ids_len={}, first_hash={:?}",
+                    event_id,
+                    dp_rank,
+                    num_blocks,
+                    token_ids_len,
+                    block_hashes.first().copied().map(BlockHashValue::into_i64),
+                );
+            }
             let original_parent_raw = parent_block_hash.map(BlockHashValue::into_i64);
             let block_token_sizes = compute_block_token_sizes(num_blocks, block_size, token_ids_len);
             let tokens_per_event_block = if num_blocks > 0 {
