@@ -70,57 +70,10 @@ curl http://localhost:8000/v1/completions \
 sudo apt install -y build-essential libhwloc-dev libudev-dev pkg-config libclang-dev protobuf-compiler python3-dev cmake
 ```
 
-### macOS:
-```bash
-brew install cmake protobuf
-```
-
-## 2. 安装 Rust
-
-```bash
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-source "$HOME/.cargo/env"
-```
-
-验证安装：
-```bash
-rustc --version  # 应该显示 1.90.0 或更高版本
-```
-
-## 3. 创建 Python 虚拟环境
-
-```bash
-# 安装 uv（如果还没有）
-curl -LsSf https://astral.sh/uv/install.sh | sh
-
-# 创建虚拟环境
-cd /path/to/dynamo
-uv venv venv
-source venv/bin/activate
-```
-
 ## 4. 安装构建工具
 
 ```bash
 uv pip install pip maturin
-```
-
-## 5. 升级 protoc（如果版本过旧）
-
-检查当前版本：
-```bash
-protoc --version
-```
-
-如果版本低于 3.12，需要升级：
-```bash
-cd /tmp
-wget https://github.com/protocolbuffers/protobuf/releases/download/v27.1/protoc-27.1-linux-x86_64.zip -O protoc.zip
-unzip -q -o protoc.zip -d /tmp/protoc_install
-sudo cp /tmp/protoc_install/bin/protoc /usr/local/bin/
-sudo chmod +x /usr/local/bin/protoc
-rm -rf /tmp/protoc_install /tmp/protoc.zip
-protoc --version  # 验证版本
 ```
 
 ## 6. 构建 Rust bindings (ai-dynamo-runtime)
@@ -130,7 +83,6 @@ cd lib/bindings/python
 source "$HOME/.cargo/env"
 # 如果同时设置了 CONDA_PREFIX 和 VIRTUAL_ENV，需要取消设置其中一个
 unset CONDA_PREFIX  # 如果使用 venv
-source /path/to/dynamo/venv/bin/activate
 maturin develop --uv
 ```
 
@@ -152,38 +104,15 @@ uv pip install -e ./LMCache --no-build-isolation
 
 使用 `-e` 进行可编辑安装，这样修改代码后无需重新安装。
 
+## 7. 安装vllm
+
+```bash
+VLLM_USE_PRECOMPILED=1 uv pip install -e ~/vllm
+```
+
 ## 8. 验证安装
 
 ```bash
 python -c "import dynamo; print('ai-dynamo installed')"
 python -c "import dynamo._core; print('ai-dynamo-runtime imported successfully')"
 ```
-
-## 常见问题
-
-### 磁盘空间不足
-如果遇到 "No space left on device" 错误：
-```bash
-# 清理 Cargo 缓存
-cargo clean
-rm -rf ~/.cargo/registry/cache
-
-# 清理构建目录
-cd lib/bindings/python
-cargo clean
-```
-
-### protoc 版本问题
-确保 protoc 版本 >= 3.12，否则会遇到 `--experimental_allow_proto3_optional` 错误。
-
-### CONDA_PREFIX 冲突
-如果同时设置了 `CONDA_PREFIX` 和 `VIRTUAL_ENV`，maturin 会报错。在使用 venv 时，取消设置 `CONDA_PREFIX`：
-```bash
-unset CONDA_PREFIX
-```
-
-## 注意事项
-
-- 从源码安装需要足够的磁盘空间（建议至少 15GB 可用空间）
-- 首次构建可能需要较长时间（10-30 分钟，取决于机器性能）
-- 如果修改了 Rust 代码，需要重新运行 `maturin develop --uv` 来重新构建

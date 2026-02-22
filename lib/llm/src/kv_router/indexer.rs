@@ -167,6 +167,8 @@ pub(crate) struct WorkerBlockInfo {
     gpu_block_hash: Option<ExternalSequenceBlockHash>,
     /// External hash for the CPU-resident copy of this block (if present).
     cpu_block_hash: Option<ExternalSequenceBlockHash>,
+    /// External hash for the CXL-resident copy of this block (if present).
+    cxl_block_hash: Option<ExternalSequenceBlockHash>,
 }
 
 /// A block in the Radix Tree.
@@ -287,6 +289,24 @@ impl Drop for RadixTree {
 }
 
 impl RadixTree {
+    fn is_gpu_medium(medium: Option<&str>) -> bool {
+        medium
+            .map(|m| m.eq_ignore_ascii_case("GPU"))
+            .unwrap_or(true) // None means GPU for backward compatibility
+    }
+
+    fn is_cxl_medium(medium: Option<&str>) -> bool {
+        medium
+            .map(|m| m.eq_ignore_ascii_case("CXL"))
+            .unwrap_or(false)
+    }
+
+    fn find_block_in_any_lookup(&self, block_hash: ExternalSequenceBlockHash) -> Option<SharedRadixBlock> {
+        self.lookup
+            .values()
+            .find_map(|worker_blocks| worker_blocks.get(&block_hash).cloned())
+    }
+
     /// Create a new `RadixTree`.
     ///
     /// ### Returns
@@ -407,14 +427,34 @@ impl RadixTree {
 
         tracing::trace!(id, "RadixTree::apply_event: Store operation: {:?}", op);
 
-        let worker_lookup = self.lookup.entry(worker).or_default();
-
         match op {
             KvCacheEventData::Stored(op) => {
+                let parent_is_cxl = op
+                    .blocks
+                    .first()
+                    .and_then(|b| b.medium.as_deref())
+                    .map(|m| m.eq_ignore_ascii_case("CXL"))
+                    .unwrap_or(false);
                 // find the parent block from this worker's lookup
                 let mut current = match op.parent_hash {
-                    Some(parent) => match worker_lookup.get(&parent) {
+                    Some(parent) => match self.lookup.get(&worker).and_then(|m| m.get(&parent)) {
                         Some(current) => current.clone(),
+                        None if parent_is_cxl => {
+                            match self.find_block_in_any_lookup(parent) {
+                                Some(current) => current,
+                                None => {
+                                    tracing::warn!(
+                                        worker_id = worker.worker_id.to_string(),
+                                        dp_rank = worker.dp_rank,
+                                        id,
+                                        parent_hash = ?op.parent_hash,
+                                        num_blocks = op.blocks.len(),
+                                        "Failed to find CXL parent block globally; skipping store operation"
+                                    );
+                                    return Err(KvCacheEventError::ParentBlockNotFound);
+                                }
+                            }
+                        }
                         None => {
                             tracing::warn!(
                                 worker_id = worker.worker_id.to_string(),
@@ -436,11 +476,7 @@ impl RadixTree {
                         Some(block) => {
                             // Verify our simplifying assumption: block_hash is uniform across workers
                             let block_borrow = block.borrow();
-                            let expected_is_gpu = block_data
-                                .medium
-                                .as_deref()
-                                .map(|m| m.eq_ignore_ascii_case("GPU"))
-                                .unwrap_or(true);
+                            let expected_is_gpu = Self::is_gpu_medium(block_data.medium.as_deref());
                             let actual_is_gpu = block_borrow
                                 .debug_medium
                                 .as_deref()
@@ -473,8 +509,10 @@ impl RadixTree {
                         }
                         None => {
                             // create new block or reuse existing from worker's lookup
-                            let new_block = worker_lookup
-                                .get(&block_data.block_hash)
+                            let new_block = self
+                                .lookup
+                                .get(&worker)
+                                .and_then(|m| m.get(&block_data.block_hash))
                                 .cloned()
                                 .unwrap_or_else(|| {
                                     Rc::new(RefCell::new(RadixBlock::with_hash(
@@ -518,32 +556,62 @@ impl RadixTree {
 
                         // add/update our worker's info for this block, tracking both GPU and CPU presence.
                         // In kv mode (!use_strata_routing), only store GPU blocks (original Dynamo behavior).
-                        let is_gpu = block_data
-                            .medium
-                            .as_deref()
-                            .map(|m| m.eq_ignore_ascii_case("GPU"))
-                            .unwrap_or(true); // None means GPU for backward compat
+                        let is_gpu = Self::is_gpu_medium(block_data.medium.as_deref());
+                        let is_cxl = Self::is_cxl_medium(block_data.medium.as_deref());
 
                         let should_store = self.use_strata_routing
                             || is_gpu; // kv mode: only GPU; kv-strata: all
 
                         if should_store {
-                            child_mut
-                                .workers
-                                .entry(worker)
-                                .and_modify(|info| {
-                                    if is_gpu {
-                                        info.gpu_block_hash = Some(block_data.block_hash);
-                                    } else {
-                                        info.cpu_block_hash = Some(block_data.block_hash);
-                                    }
-                                })
-                                .or_insert_with(|| WorkerBlockInfo {
-                                    gpu_block_hash: is_gpu.then_some(block_data.block_hash),
-                                    cpu_block_hash: (!is_gpu).then_some(block_data.block_hash),
-                                });
-                            // add the block to the worker's lookup table (only when we store)
-                            worker_lookup.insert(block_data.block_hash, child.clone());
+                            if is_cxl {
+                                // CXL blocks are globally shareable across workers.
+                                // Record this block under all currently tracked workers so every
+                                // worker can route to it, regardless of the source worker id.
+                                let mut target_workers: Vec<WorkerWithDpRank> =
+                                    self.lookup.keys().copied().collect();
+                                if !target_workers.contains(&worker) {
+                                    target_workers.push(worker);
+                                }
+
+                                for target_worker in target_workers {
+                                    child_mut
+                                        .workers
+                                        .entry(target_worker)
+                                        .and_modify(|info| {
+                                            info.cxl_block_hash = Some(block_data.block_hash);
+                                        })
+                                        .or_insert_with(|| WorkerBlockInfo {
+                                            gpu_block_hash: None,
+                                            cpu_block_hash: None,
+                                            cxl_block_hash: Some(block_data.block_hash),
+                                        });
+                                    self.lookup
+                                        .entry(target_worker)
+                                        .or_default()
+                                        .insert(block_data.block_hash, child.clone());
+                                }
+                            } else {
+                                child_mut
+                                    .workers
+                                    .entry(worker)
+                                    .and_modify(|info| {
+                                        if is_gpu {
+                                            info.gpu_block_hash = Some(block_data.block_hash);
+                                        } else {
+                                            info.cpu_block_hash = Some(block_data.block_hash);
+                                        }
+                                    })
+                                    .or_insert_with(|| WorkerBlockInfo {
+                                        gpu_block_hash: is_gpu.then_some(block_data.block_hash),
+                                        cpu_block_hash: (!is_gpu).then_some(block_data.block_hash),
+                                        cxl_block_hash: None,
+                                    });
+                                // Add the block to the worker's lookup table (only when we store)
+                                self.lookup
+                                    .entry(worker)
+                                    .or_default()
+                                    .insert(block_data.block_hash, child.clone());
+                            }
                         }
                     }
 
@@ -558,10 +626,12 @@ impl RadixTree {
                 enum RemoveTier {
                     Gpu,
                     Cpu,
+                    Cxl,
                     Both,
                 }
                 let remove_tier = match remove.medium.as_deref() {
                     Some(m) if m.eq_ignore_ascii_case("GPU") => RemoveTier::Gpu,
+                    Some(m) if m.eq_ignore_ascii_case("CXL") => RemoveTier::Cxl,
                     Some(_) => RemoveTier::Cpu,
                     None => {
                         tracing::warn!(
@@ -575,105 +645,103 @@ impl RadixTree {
                 };
                 let mut kv_cache_err: Option<KvCacheEventError> = None;
                 for block in remove.block_hashes {
-                    // lookup block in worker's table
-                    let entry = match worker_lookup.get(&block) {
-                        Some(entry) => entry.clone(),
-                        None => {
-                            tracing::warn!(
-                                worker_id = worker.worker_id.to_string(),
-                                dp_rank = worker.dp_rank,
-                                id,
-                                block_hash = ?block,
-                                "Failed to find block to remove; skipping remove operation"
-                            );
-                            // Kv cache removed events may be batched; we should try to apply all
-                            // operations in the batch before returning an error. Return the first
-                            // error.
-                            if kv_cache_err.is_none() {
-                                kv_cache_err = Some(KvCacheEventError::BlockNotFound);
+                    // CXL remove events are global: apply to all workers.
+                    let target_workers: Vec<WorkerWithDpRank> = match remove_tier {
+                        RemoveTier::Cxl => self.lookup.keys().copied().collect(),
+                        _ => vec![worker],
+                    };
+
+                    let mut removed_any = false;
+                    for target_worker in target_workers {
+                        let entry = match self.lookup.get(&target_worker).and_then(|m| m.get(&block)).cloned() {
+                            Some(entry) => entry,
+                            None => continue,
+                        };
+
+                        let mut guard = entry.borrow_mut();
+                        let Some(info) = guard.workers.get_mut(&target_worker) else {
+                            continue;
+                        };
+
+                        // Clear only the target tier; a remove is considered successful
+                        // only when that tier actually matched this block hash.
+                        let removed_target_tier = match remove_tier {
+                            RemoveTier::Gpu => {
+                                let matched = info.gpu_block_hash == Some(block);
+                                if matched {
+                                    info.gpu_block_hash = None;
+                                }
+                                matched
                             }
+                            RemoveTier::Cpu => {
+                                let matched = info.cpu_block_hash == Some(block);
+                                if matched {
+                                    info.cpu_block_hash = None;
+                                }
+                                matched
+                            }
+                            RemoveTier::Cxl => {
+                                let matched = info.cxl_block_hash == Some(block);
+                                if matched {
+                                    info.cxl_block_hash = None;
+                                }
+                                matched
+                            }
+                            RemoveTier::Both => {
+                                let mut matched = false;
+                                if info.gpu_block_hash == Some(block) {
+                                    info.gpu_block_hash = None;
+                                    matched = true;
+                                }
+                                if info.cpu_block_hash == Some(block) {
+                                    info.cpu_block_hash = None;
+                                    matched = true;
+                                }
+                                if info.cxl_block_hash == Some(block) {
+                                    info.cxl_block_hash = None;
+                                    matched = true;
+                                }
+                                matched
+                            }
+                        };
+
+                        if !removed_target_tier {
                             continue;
                         }
-                    };
+                        removed_any = true;
 
-                    let mut guard = entry.borrow_mut();
-                    let Some(info) = guard.workers.get_mut(&worker) else {
+                        // Remove worker entry only if no tiers remain for this worker on this block.
+                        let no_tiers_left = info.gpu_block_hash.is_none()
+                            && info.cpu_block_hash.is_none()
+                            && info.cxl_block_hash.is_none();
+                        if no_tiers_left {
+                            guard.workers.remove(&target_worker);
+                        }
+
+                        if guard.workers.is_empty() {
+                            // If no workers are using this block, that is true for all children.
+                            guard.children.clear();
+                        }
+                        // Remove lookup entry only when this worker no longer has this block in any tier.
+                        if no_tiers_left
+                            && let Some(lookup) = self.lookup.get_mut(&target_worker)
+                        {
+                            lookup.remove(&block);
+                        }
+                    }
+
+                    if !removed_any {
                         tracing::warn!(
                             worker_id = worker.worker_id.to_string(),
                             dp_rank = worker.dp_rank,
                             id,
                             block_hash = ?block,
                             remove_medium = ?remove.medium,
-                            "Found block in lookup but worker has no tier info; skipping remove operation"
+                            "Failed to find block to remove in requested medium; skipping remove operation"
                         );
                         if kv_cache_err.is_none() {
                             kv_cache_err = Some(KvCacheEventError::BlockNotFound);
                         }
-                        continue;
-                    };
-
-                    // Clear only the target tier; a remove is considered successful
-                    // only when that tier actually matched this block hash.
-                    let removed_target_tier = match remove_tier {
-                        RemoveTier::Gpu => {
-                            let matched = info.gpu_block_hash == Some(block);
-                            if matched {
-                                info.gpu_block_hash = None;
-                            }
-                            matched
-                        }
-                        RemoveTier::Cpu => {
-                            let matched = info.cpu_block_hash == Some(block);
-                            if matched {
-                                info.cpu_block_hash = None;
-                            }
-                            matched
-                        }
-                        RemoveTier::Both => {
-                            let mut matched = false;
-                            if info.gpu_block_hash == Some(block) {
-                                info.gpu_block_hash = None;
-                                matched = true;
-                            }
-                            if info.cpu_block_hash == Some(block) {
-                                info.cpu_block_hash = None;
-                                matched = true;
-                            }
-                            matched
-                        }
-                    };
-
-                    if !removed_target_tier {
-                        tracing::warn!(
-                            worker_id = worker.worker_id.to_string(),
-                            dp_rank = worker.dp_rank,
-                            id,
-                            block_hash = ?block,
-                            remove_medium = ?remove.medium,
-                            gpu_block_hash = ?info.gpu_block_hash,
-                            cpu_block_hash = ?info.cpu_block_hash,
-                            "Remove tier mismatch: block exists but not in requested medium"
-                        );
-                        if kv_cache_err.is_none() {
-                            kv_cache_err = Some(KvCacheEventError::BlockNotFound);
-                        }
-                        continue;
-                    }
-
-                    // Remove worker entry only if no tiers remain for this worker on this block.
-                    let no_tiers_left =
-                        info.gpu_block_hash.is_none() && info.cpu_block_hash.is_none();
-                    if no_tiers_left {
-                        guard.workers.remove(&worker);
-                    }
-
-                    if guard.workers.is_empty() {
-                        // if no workers are using this block, that is true for all children
-                        guard.children.clear();
-                    }
-                    // Remove lookup entry only when this worker no longer has this block in any tier.
-                    if no_tiers_left {
-                        worker_lookup.remove(&block);
                     }
                 }
                 kv_cache_err.map_or(Ok(()), Err)
@@ -764,10 +832,11 @@ impl RadixTree {
 
             // For each worker that has this block, emit one event per present medium tier.
             for (worker_id, block_info) in &current_borrow.workers {
-                // Emit one store event per tier we know about (GPU + CPU).
+                // Emit one store event per tier we know about (GPU + CPU + CXL).
                 for (tier_hash, tier_medium) in [
                     (block_info.gpu_block_hash, Some("GPU".to_string())),
                     (block_info.cpu_block_hash, Some("CPU".to_string())),
+                    (block_info.cxl_block_hash, Some("CXL".to_string())),
                 ] {
                     let Some(block_hash) = tier_hash else { continue };
 
@@ -911,6 +980,9 @@ pub struct OverlapScores {
     pub gpu_scores: HashMap<WorkerWithDpRank, u32>,
     // map of worker (with dp_rank) to CPU match count
     pub cpu_scores: HashMap<WorkerWithDpRank, u32>,
+    // map of worker (with dp_rank) to CXL match count
+    #[serde(default)]
+    pub cxl_scores: HashMap<WorkerWithDpRank, u32>,
     // map of worker (with dp_rank) to blocks present in both GPU and CPU tiers
     #[serde(default)]
     pub gpu_and_cpu_scores: HashMap<WorkerWithDpRank, u32>,
@@ -939,6 +1011,7 @@ impl OverlapScores {
         Self {
             gpu_scores: HashMap::new(),
             cpu_scores: HashMap::new(),
+            cxl_scores: HashMap::new(),
             gpu_and_cpu_scores: HashMap::new(),
             frequencies: Vec::with_capacity(32),
             tree_sizes: HashMap::new(),
@@ -961,9 +1034,11 @@ impl OverlapScores {
             // kv-strata: CPU score represents GPU-uncovered CPU matches.
             let has_gpu = block_info.gpu_block_hash.is_some();
             let has_cpu = block_info.cpu_block_hash.is_some();
+            let has_cxl = block_info.cxl_block_hash.is_some();
+            let has_cpu_like = has_cpu || has_cxl;
             let count_gpu = has_gpu;
-            let count_cpu = use_strata_routing && has_cpu && !has_gpu;
-            let count_both = use_strata_routing && has_gpu && has_cpu;
+            let count_cpu = use_strata_routing && has_cpu_like && !has_gpu;
+            let count_both = use_strata_routing && has_gpu && has_cpu_like;
 
             if count_gpu {
                 let score = self.gpu_scores.entry(*worker).or_insert(0);
@@ -971,6 +1046,10 @@ impl OverlapScores {
             }
             if count_cpu {
                 let score = self.cpu_scores.entry(*worker).or_insert(0);
+                *score += 1;
+            }
+            if use_strata_routing && has_cxl {
+                let score = self.cxl_scores.entry(*worker).or_insert(0);
                 *score += 1;
             }
             if count_both {

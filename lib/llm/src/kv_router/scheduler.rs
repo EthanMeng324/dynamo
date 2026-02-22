@@ -602,13 +602,13 @@ impl WorkerSelector for DefaultWorkerSelector {
         let best_overlap = *overlaps.get(&best_worker).unwrap_or(&0);
         let best_gpu_score = request.overlaps.gpu_scores.get(&best_worker).copied().unwrap_or(0);
         let best_cpu_score = request.overlaps.cpu_scores.get(&best_worker).copied().unwrap_or(0);
-        let best_both_score = request
+        let best_cxl_score = request
             .overlaps
-            .gpu_and_cpu_scores
+            .cxl_scores
             .get(&best_worker)
             .copied()
             .unwrap_or(0);
-        let best_gpu_only_score = best_gpu_score.saturating_sub(best_both_score);
+        let request_total_blocks = request_blocks;
 
         // this is a runtime config set on a per worker basis, not per dp-rank
         let total_blocks_info = workers
@@ -627,25 +627,25 @@ impl WorkerSelector for DefaultWorkerSelector {
 
         let log_msg = if self.kv_router_config.use_strata_routing {
             format!(
-                "Routing decision: worker_id={} dp_rank={:?}, logit={:.3}, total_cached_blocks={}, gpu_matches={}, cpu_matches={}, gpu_only_blocks={}, cpu_only_blocks={}, gpu_and_cpu_blocks={}, tree_size={}{}",
+                "Routing decision: worker_id={} dp_rank={:?}, logit={:.3}, request_total_blocks={}, total_cached_blocks={}, gpu_matches={}, cpu_matches={}, cxl_matches={}, tree_size={}{}",
                 best_worker.worker_id,
                 best_worker.dp_rank,
                 best_logit,
+                request_total_blocks,
                 best_overlap,
                 best_gpu_score,
                 best_cpu_score,
-                best_gpu_only_score,
-                best_cpu_score,
-                best_both_score,
+                best_cxl_score,
                 tree_size,
                 total_blocks_info
             )
         } else {
             format!(
-                "Routing decision: worker_id={} dp_rank={:?}, logit={:.3}, total_cached_blocks={}, tree_size={}{}",
+                "Routing decision: worker_id={} dp_rank={:?}, logit={:.3}, request_total_blocks={}, total_cached_blocks={}, tree_size={}{}",
                 best_worker.worker_id,
                 best_worker.dp_rank,
                 best_logit,
+                request_total_blocks,
                 best_overlap,
                 tree_size,
                 total_blocks_info
