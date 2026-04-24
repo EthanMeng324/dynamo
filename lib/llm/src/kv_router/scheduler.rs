@@ -508,9 +508,39 @@ impl WorkerSelector for DefaultWorkerSelector {
                 // Get overlap for this worker (defaults to 0 if not in overlaps)
                 let overlap = *overlaps.get(&worker).unwrap_or(&0);
 
-                // this is the number of prefill tokens the worker would have if the request were scheduled there
-                let prefill_token = *prefill_tokens.get(&worker).unwrap_or(&isl);
-                let potential_prefill_block = (prefill_token as f64) / (block_size as f64);
+                // In kv-strata mode, rebuild the potential prefill block count using per-tier
+                // weights so CPU/CXL hits contribute less than a GPU hit. In kv mode, keep the
+                // pre-computed prefill_tokens (GPU-only) untouched.
+                let potential_prefill_block = if self.kv_router_config.use_strata_routing {
+                    let gpu_blocks = request
+                        .overlaps
+                        .gpu_scores
+                        .get(&worker)
+                        .copied()
+                        .unwrap_or(0) as f64;
+                    let cpu_blocks = request
+                        .overlaps
+                        .cpu_scores
+                        .get(&worker)
+                        .copied()
+                        .unwrap_or(0) as f64;
+                    let cxl_blocks = request
+                        .overlaps
+                        .cxl_scores
+                        .get(&worker)
+                        .copied()
+                        .unwrap_or(0) as f64;
+                    let effective_overlap = gpu_blocks
+                        + self.kv_router_config.strata_cpu_overlap_weight * cpu_blocks
+                        + self.kv_router_config.strata_cxl_overlap_weight * cxl_blocks;
+                    let effective_cached_tokens = effective_overlap * (block_size as f64);
+                    let effective_prefill_token =
+                        ((isl as f64) - effective_cached_tokens).max(0.0);
+                    effective_prefill_token / (block_size as f64)
+                } else {
+                    let prefill_token = *prefill_tokens.get(&worker).unwrap_or(&isl);
+                    (prefill_token as f64) / (block_size as f64)
+                };
 
                 // this is the number of decode blocks the worker would have if the request were scheduled there
                 let decode_block = *decode_blocks

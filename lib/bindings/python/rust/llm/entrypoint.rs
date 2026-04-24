@@ -50,7 +50,7 @@ impl KvRouterConfig {
 #[pymethods]
 impl KvRouterConfig {
     #[new]
-    #[pyo3(signature = (overlap_score_weight=1.0, router_temperature=0.0, use_kv_events=true, router_replica_sync=false, router_track_active_blocks=true, router_track_output_blocks=false, router_assume_kv_reuse=true, router_snapshot_threshold=1000000, router_reset_states=false, router_ttl_secs=120.0, router_max_tree_size=1048576, router_prune_target_ratio=0.8, use_strata_routing=false))]
+    #[pyo3(signature = (overlap_score_weight=1.0, router_temperature=0.0, use_kv_events=true, router_replica_sync=false, router_track_active_blocks=true, router_track_output_blocks=false, router_assume_kv_reuse=true, router_snapshot_threshold=1000000, router_reset_states=false, router_ttl_secs=120.0, router_max_tree_size=1048576, router_prune_target_ratio=0.8, use_strata_routing=false, strata_cpu_overlap_weight=0.9, strata_cxl_overlap_weight=0.8))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         overlap_score_weight: f64,
@@ -66,6 +66,8 @@ impl KvRouterConfig {
         router_max_tree_size: usize,
         router_prune_target_ratio: f64,
         use_strata_routing: bool,
+        strata_cpu_overlap_weight: f64,
+        strata_cxl_overlap_weight: f64,
     ) -> Self {
         KvRouterConfig {
             inner: RsKvRouterConfig {
@@ -82,6 +84,8 @@ impl KvRouterConfig {
                 router_max_tree_size,
                 router_prune_target_ratio,
                 use_strata_routing,
+                strata_cpu_overlap_weight,
+                strata_cxl_overlap_weight,
             },
         }
     }

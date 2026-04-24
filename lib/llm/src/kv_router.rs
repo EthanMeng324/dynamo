@@ -166,6 +166,15 @@ pub struct KvRouterConfig {
     /// When true (kv-strata mode), consider cache hits from all memory tiers (GPU, CPU, KVBM).
     /// When false (kv mode), only consider GPU cache hits (original Dynamo behavior).
     pub use_strata_routing: bool,
+
+    /// Weight (<= 1.0) applied to CPU cache hits relative to GPU hits when scoring workers
+    /// in kv-strata mode. Smaller values discount CPU hits because CPU->GPU transfers are
+    /// slower than a GPU-resident hit. Unused in kv mode.
+    pub strata_cpu_overlap_weight: f64,
+
+    /// Weight (<= 1.0) applied to CXL cache hits relative to GPU hits in kv-strata mode.
+    /// Typically lower than the CPU weight to reflect the higher transfer cost. Unused in kv mode.
+    pub strata_cxl_overlap_weight: f64,
 }
 
 impl Default for KvRouterConfig {
@@ -184,6 +193,8 @@ impl Default for KvRouterConfig {
             router_max_tree_size: 2usize.pow(20), // 2^20 = 1048576, matches PruneConfig::default()
             router_prune_target_ratio: 0.8,
             use_strata_routing: false, // original Dynamo: only GPU cache hit
+            strata_cpu_overlap_weight: 0.9,
+            strata_cxl_overlap_weight: 0.8,
         }
     }
 }
@@ -206,6 +217,8 @@ impl KvRouterConfig {
         router_max_tree_size: Option<usize>,
         router_prune_target_ratio: Option<f64>,
         use_strata_routing: Option<bool>,
+        strata_cpu_overlap_weight: Option<f64>,
+        strata_cxl_overlap_weight: Option<f64>,
     ) -> Self {
         let default = Self::default();
         Self {
@@ -226,6 +239,10 @@ impl KvRouterConfig {
             router_prune_target_ratio: router_prune_target_ratio
                 .unwrap_or(default.router_prune_target_ratio),
             use_strata_routing: use_strata_routing.unwrap_or(default.use_strata_routing),
+            strata_cpu_overlap_weight: strata_cpu_overlap_weight
+                .unwrap_or(default.strata_cpu_overlap_weight),
+            strata_cxl_overlap_weight: strata_cxl_overlap_weight
+                .unwrap_or(default.strata_cxl_overlap_weight),
         }
     }
 

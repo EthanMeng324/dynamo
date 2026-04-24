@@ -151,6 +151,18 @@ def parse_args():
         help="KV Router: Temperature for worker sampling via softmax. Higher values promote more randomness, and 0 fallbacks to deterministic.",
     )
     parser.add_argument(
+        "--strata-cpu-overlap-weight",
+        type=float,
+        default=float(os.environ.get("DYN_STRATA_CPU_OVERLAP_WEIGHT", "0.9")),
+        help="kv-strata only: weight (<=1.0) applied to CPU cache hits relative to GPU hits when scoring workers. 1.0 counts CPU hits equal to GPU hits; smaller values discount CPU hits to reflect CPU->GPU transfer cost. Ignored in 'kv' mode.",
+    )
+    parser.add_argument(
+        "--strata-cxl-overlap-weight",
+        type=float,
+        default=float(os.environ.get("DYN_STRATA_CXL_OVERLAP_WEIGHT", "0.8")),
+        help="kv-strata only: weight (<=1.0) applied to CXL cache hits relative to GPU hits when scoring workers. Typically lower than --strata-cpu-overlap-weight. Ignored in 'kv' mode.",
+    )
+    parser.add_argument(
         "--kv-events",
         action=argparse.BooleanOptionalAction,
         dest="use_kv_events",
@@ -393,6 +405,8 @@ async def async_main():
             router_max_tree_size=flags.router_max_tree_size,
             router_prune_target_ratio=flags.router_prune_target_ratio,
             use_strata_routing=use_strata_routing,
+            strata_cpu_overlap_weight=flags.strata_cpu_overlap_weight,
+            strata_cxl_overlap_weight=flags.strata_cxl_overlap_weight,
         )
     elif flags.router_mode == "random":
         router_mode = RouterMode.Random

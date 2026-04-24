@@ -1031,13 +1031,15 @@ impl OverlapScores {
     {
         for (worker, block_info) in worker_blocks {
             // kv mode: only count GPU.
-            // kv-strata: CPU score represents GPU-uncovered CPU matches.
+            // kv-strata: record GPU/CPU/CXL matches as disjoint categories so the scheduler
+            // can apply per-tier weights. Priority: GPU > CPU > CXL (higher tier shadows lower).
             let has_gpu = block_info.gpu_block_hash.is_some();
             let has_cpu = block_info.cpu_block_hash.is_some();
             let has_cxl = block_info.cxl_block_hash.is_some();
             let has_cpu_like = has_cpu || has_cxl;
             let count_gpu = has_gpu;
-            let count_cpu = use_strata_routing && has_cpu_like && !has_gpu;
+            let count_cpu = use_strata_routing && has_cpu && !has_gpu;
+            let count_cxl = use_strata_routing && has_cxl && !has_gpu && !has_cpu;
             let count_both = use_strata_routing && has_gpu && has_cpu_like;
 
             if count_gpu {
@@ -1048,7 +1050,7 @@ impl OverlapScores {
                 let score = self.cpu_scores.entry(*worker).or_insert(0);
                 *score += 1;
             }
-            if use_strata_routing && has_cxl {
+            if count_cxl {
                 let score = self.cxl_scores.entry(*worker).or_insert(0);
                 *score += 1;
             }
@@ -1056,7 +1058,7 @@ impl OverlapScores {
                 let score = self.gpu_and_cpu_scores.entry(*worker).or_insert(0);
                 *score += 1;
             }
-            if !(count_gpu || count_cpu) {
+            if !(count_gpu || count_cpu || count_cxl) {
                 continue;
             }
 

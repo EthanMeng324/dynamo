@@ -14,11 +14,16 @@ python -m dynamo.vllm \
 
 ### Multi Node:
 #### s7:
-export HEAD_NODE_IP="192.168.3.67"
+export HEAD_NODE_IP="172.31.20.142"
 export NATS_SERVER="nats://${HEAD_NODE_IP}:4222"
 export ETCD_ENDPOINTS="${HEAD_NODE_IP}:2379"
 
-python -m dynamo.frontend --router-mode kv-strata --router-reset-states --kv-cache-block-size 256
+python -m dynamo.frontend --router-mode kv-strata --router-reset-states --kv-cache-block-size 256 \
+  --strata-cpu-overlap-weight 0.9 \
+  --strata-cxl-overlap-weight 0.8
+# kv-strata 专用：打分时把 CPU/CXL 命中按权重折算成 GPU 等效命中
+#   - 1.0 等价于"两者之和"；默认 cpu=0.9 / cxl=0.8
+#   - 也可通过 DYN_STRATA_CPU_OVERLAP_WEIGHT / DYN_STRATA_CXL_OVERLAP_WEIGHT 环境变量设置
 
 sudo -E env CUDA_VISIBLE_DEVICES=0 \
 PYTHONHASHSEED=0 \
