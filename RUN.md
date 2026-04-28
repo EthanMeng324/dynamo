@@ -14,7 +14,7 @@ python -m dynamo.vllm \
 
 ### Multi Node:
 #### s7:
-export HEAD_NODE_IP="172.31.20.142"
+export HEAD_NODE_IP="65.167.196.171"
 export NATS_SERVER="nats://${HEAD_NODE_IP}:4222"
 export ETCD_ENDPOINTS="${HEAD_NODE_IP}:2379"
 
@@ -42,7 +42,7 @@ LMCACHE_CONFIG_FILE=lmcache.yaml \
   --model Qwen/Qwen2.5-7B-Instruct \
   --gpu-memory-utilization 0.8 \
   --connector lmcache \
-  --kv-events-config '{"enable_kv_cache_events":"True","publisher":"zmq","topic":"kv-events"}'
+  --kv-events-config '{"enable_kv_cache_events":"True","publisher":"zmq","topic":"kv-events"}' \
   --block-size 256
 
 curl http://localhost:8000/v1/completions \

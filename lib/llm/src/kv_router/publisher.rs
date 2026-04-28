@@ -628,15 +628,16 @@ fn convert_event(
                     }
                 })
                 .map(|parent| {
-                    let specific = expanded_block_hashes
+                    // Look up the expanded parent hash *strictly* in this
+                    // event's medium. A cross-medium fallback would let a GPU
+                    // BlockStored carry a CPU-medium parent hash that the
+                    // kv-mode indexer (which only stores GPU entries via
+                    // `should_store = use_strata_routing || is_gpu`) cannot
+                    // resolve, causing the store to be skipped with
+                    // "Failed to find parent block".
+                    expanded_block_hashes
                         .get(&(parent.0, medium_key.clone()))
-                        .and_then(|expanded| expanded.last().copied());
-                    let fallback = expanded_block_hashes
-                        .iter()
-                        .find(|((raw_parent, _), _)| *raw_parent == parent.0)
-                        .and_then(|(_, expanded)| expanded.last().copied());
-                    specific
-                        .or(fallback)
+                        .and_then(|expanded| expanded.last().copied())
                         .map(ExternalSequenceBlockHash::from)
                         .unwrap_or(parent)
                 });

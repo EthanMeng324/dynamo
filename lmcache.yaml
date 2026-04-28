@@ -52,7 +52,7 @@ extra_config:
   
   # CXL device size in GB (single source for both Python accounting and C mapping).
   # Set to none/null to use default device size.
-  max_cxl_size: 30.0
+  max_cxl_size: 60.0
 
   storage_write_policy: write_back
   write_back_targets: ["CxlBackend"] 
