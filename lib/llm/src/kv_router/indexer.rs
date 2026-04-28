@@ -555,12 +555,20 @@ impl RadixTree {
                         }
 
                         // add/update our worker's info for this block, tracking both GPU and CPU presence.
-                        // In kv mode (!use_strata_routing), only store GPU blocks (original Dynamo behavior).
+                        //
+                        // Both kv and kv-strata modes accept events from every tier here, matching
+                        // v0.9.0's behavior: v0.9.0's `KvCacheStoredBlockData` had no `medium` field
+                        // and the publisher dropped the raw medium, so vLLM's GPU events and
+                        // LMCache's CPU events were stored uniformly into a single
+                        // `workers: HashSet<WorkerWithDpRank>` per block. The medium-aware tier
+                        // tracking added in kv-strata only changes how `update_scores` weighs
+                        // those tiers (see indexer.rs:1032 onward); it must NOT change which
+                        // events get into the radix tree, otherwise kv mode silently drops
+                        // LMCache CPU events that v0.9.0 would have counted as prefix matches.
                         let is_gpu = Self::is_gpu_medium(block_data.medium.as_deref());
                         let is_cxl = Self::is_cxl_medium(block_data.medium.as_deref());
 
-                        let should_store = self.use_strata_routing
-                            || is_gpu; // kv mode: only GPU; kv-strata: all
+                        let should_store = true;
 
                         if should_store {
                             if is_cxl {
@@ -1024,20 +1032,27 @@ impl OverlapScores {
     /// ### Arguments
     ///
     /// * `worker_blocks` - An iterator over `(&WorkerWithDpRank, &WorkerBlockInfo)` tuples.
-    /// * `use_strata_routing` - When false (kv mode), only count GPU blocks. When true (kv-strata), count both GPU and CPU.
+    /// * `use_strata_routing` - When false (kv mode), match v0.9.0 behavior: any
+    ///   tier registered for the worker counts the block as a prefix match (v0.9.0
+    ///   stored a single `workers: HashSet<WorkerWithDpRank>` per block, with no
+    ///   medium concept). When true (kv-strata), bucket matches into disjoint
+    ///   GPU/CPU/CXL categories so the scheduler can apply per-tier weights.
     pub(crate) fn update_scores<'a, I>(&mut self, worker_blocks: I, use_strata_routing: bool)
     where
         I: IntoIterator<Item = (&'a WorkerWithDpRank, &'a WorkerBlockInfo)>,
     {
         for (worker, block_info) in worker_blocks {
-            // kv mode: only count GPU.
-            // kv-strata: record GPU/CPU/CXL matches as disjoint categories so the scheduler
-            // can apply per-tier weights. Priority: GPU > CPU > CXL (higher tier shadows lower).
             let has_gpu = block_info.gpu_block_hash.is_some();
             let has_cpu = block_info.cpu_block_hash.is_some();
             let has_cxl = block_info.cxl_block_hash.is_some();
+            let has_any = has_gpu || has_cpu || has_cxl;
+
+            // kv-strata: record disjoint per-tier counts so the scheduler can
+            // apply per-tier weights (priority: GPU > CPU > CXL).
+            // kv mode: collapse all tiers into the GPU-equivalent bucket
+            // (matches v0.9.0's tier-blind HashSet behavior).
+            let count_gpu = if use_strata_routing { has_gpu } else { has_any };
             let has_cpu_like = has_cpu || has_cxl;
-            let count_gpu = has_gpu;
             let count_cpu = use_strata_routing && has_cpu && !has_gpu;
             let count_cxl = use_strata_routing && has_cxl && !has_gpu && !has_cpu;
             let count_both = use_strata_routing && has_gpu && has_cpu_like;
