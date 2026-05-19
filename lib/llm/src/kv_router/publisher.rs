@@ -674,6 +674,25 @@ fn convert_event(
                     );
                     let this_sub_idx = sub_idx as u32;
                     let block_hash = derive_expanded_block_hash(*original_hash_u64, sub_idx, tokens_hash);
+                    // PUB_HASH diagnostic: dump enough to correlate against
+                    // META_STORE_CPU/META_READ_CXL from LMCache. Length, head/tail,
+                    // and the computed tokens_hash are sufficient to localize a
+                    // discrepancy on either side of the ZMQ wire.
+                    {
+                        let head: Vec<u32> = tokens.iter().take(4).copied().collect();
+                        let tail: Vec<u32> = tokens.iter().rev().take(4).rev().copied().collect();
+                        tracing::info!(
+                            "PUB_HASH: medium={:?} original_hash={} sub_idx={} tok_len={} tokens_hash={} block_hash={} head={:?} tail={:?}",
+                            medium,
+                            *original_hash_i64,
+                            sub_idx,
+                            tokens.len(),
+                            tokens_hash.0,
+                            block_hash.0,
+                            head,
+                            tail,
+                        );
+                    }
                     sub_idx += 1;
                     expanded_hashes_for_block.push(block_hash.0);
                     blocks.push(KvCacheStoredBlockData {

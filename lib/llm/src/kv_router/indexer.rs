@@ -356,6 +356,26 @@ impl RadixTree {
             if let Some(block) = next_block {
                 {
                     let block_borrow = block.borrow();
+                    let summary: Vec<String> = block_borrow
+                        .workers
+                        .iter()
+                        .map(|(w, info)| {
+                            format!(
+                                "w={}:gpu={},cpu={},cxl={}",
+                                w.worker_id,
+                                info.gpu_block_hash.is_some(),
+                                info.cpu_block_hash.is_some(),
+                                info.cxl_block_hash.is_some()
+                            )
+                        })
+                        .collect();
+                    tracing::info!(
+                        "FM_STEP idx={} TH={} n_workers={} workers={:?}",
+                        idx,
+                        block_hash.0,
+                        block_borrow.workers.len(),
+                        summary
+                    );
                     scores.update_scores(
                         block_borrow.workers.iter(),
                         self.use_strata_routing,
@@ -385,11 +405,40 @@ impl RadixTree {
 
                 current = block;
             } else {
-                tracing::trace!(
-                    "RadixTree::find_matches: block not found at index {} for hash {}",
+                // Snapshot the current block (the last successfully visited one
+                // or root if idx==0) to help diagnose where the chain breaks.
+                let cur_borrow = current.borrow();
+                let cur_children_n = cur_borrow.children.len();
+                let cur_workers_n = cur_borrow.workers.len();
+                let cur_workers_summary: Vec<String> = cur_borrow
+                    .workers
+                    .iter()
+                    .map(|(w, info)| {
+                        format!(
+                            "w={}:gpu={},cpu={},cxl={}",
+                            w.worker_id,
+                            info.gpu_block_hash.is_some(),
+                            info.cpu_block_hash.is_some(),
+                            info.cxl_block_hash.is_some()
+                        )
+                    })
+                    .collect();
+                let sample_children: Vec<String> = cur_borrow
+                    .children
+                    .keys()
+                    .take(5)
+                    .map(|k| k.0.to_string())
+                    .collect();
+                tracing::info!(
+                    "FM_BREAK at idx={} missing_TH={} parent_children_n={} parent_workers_n={} parent_workers={:?} child_TH_samples={:?}",
                     idx,
-                    block_hash.0
+                    block_hash.0,
+                    cur_children_n,
+                    cur_workers_n,
+                    cur_workers_summary,
+                    sample_children,
                 );
+                drop(cur_borrow);
                 break;
             }
         }
@@ -489,6 +538,7 @@ impl RadixTree {
                                     worker_id = worker.worker_id.to_string(),
                                     dp_rank = worker.dp_rank,
                                     event_id = id,
+                                    tokens_hash = block_data.tokens_hash.0,
                                     expected_block_hash = ?block_data.block_hash,
                                     actual_block_hash = ?block_borrow.block_hash,
                                     expected_parent_raw = ?block_data.parent_raw,
