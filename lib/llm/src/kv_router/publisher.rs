@@ -681,7 +681,7 @@ fn convert_event(
                     {
                         let head: Vec<u32> = tokens.iter().take(4).copied().collect();
                         let tail: Vec<u32> = tokens.iter().rev().take(4).rev().copied().collect();
-                        tracing::info!(
+                        tracing::debug!(
                             "PUB_HASH: medium={:?} original_hash={} sub_idx={} tok_len={} tokens_hash={} block_hash={} head={:?} tail={:?}",
                             medium,
                             *original_hash_i64,

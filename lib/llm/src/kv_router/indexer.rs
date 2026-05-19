@@ -524,14 +524,21 @@ impl RadixTree {
                     let child = match parent_mut.children.get(&block_data.tokens_hash) {
                         Some(block) => {
                             // Verify our simplifying assumption: block_hash is uniform across workers
+                            // for events of the *same* medium. GPU events (from vLLM) and
+                            // CPU/CXL events (from LMCache) live in separate original_hash
+                            // namespaces, so their derived block_hashes will differ for the
+                            // same logical chunk — that is expected, not a bug. Likewise
+                            // CPU and CXL come from independent emission paths and should
+                            // not be compared by block_hash either.
                             let block_borrow = block.borrow();
-                            let expected_is_gpu = Self::is_gpu_medium(block_data.medium.as_deref());
-                            let actual_is_gpu = block_borrow
-                                .debug_medium
-                                .as_deref()
-                                .map(|m| m.eq_ignore_ascii_case("GPU"))
-                                .unwrap_or(true);
-                            if expected_is_gpu == actual_is_gpu
+                            let medium_matches = match (
+                                block_data.medium.as_deref(),
+                                block_borrow.debug_medium.as_deref(),
+                            ) {
+                                (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+                                _ => false,
+                            };
+                            if medium_matches
                                 && block_borrow.block_hash != Some(block_data.block_hash)
                             {
                                 tracing::warn!(
@@ -596,7 +603,11 @@ impl RadixTree {
                                 return Err(KvCacheEventError::InvalidBlockSequence);
                             }
                         };
-                        if child_mut.debug_parent_hash.is_none() {
+                        // Use debug_medium as the "initialized" sentinel — debug_parent_hash
+                        // is None for first-chunk events even after they've populated the
+                        // other debug fields, which previously let a later cross-medium
+                        // event overwrite the recorded creator info.
+                        if child_mut.debug_medium.is_none() {
                             child_mut.debug_original_hash = block_data.original_hash;
                             child_mut.debug_sub_idx = block_data.sub_idx;
                             child_mut.debug_parent_raw = block_data.parent_raw;
