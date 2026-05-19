@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::fmt;
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
@@ -456,7 +455,6 @@ pub async fn start_zmq_listener(
     #[allow(unused_assignments)]
     let mut exit_reason = "unknown";
     let mut messages_processed = 0u64;
-    let mut expanded_block_hashes: HashMap<(u64, Option<String>), Vec<u64>> = HashMap::new();
 
     'main: loop {
         tokio::select! {
@@ -547,7 +545,6 @@ pub async fn start_zmq_listener(
                         kv_block_size,
                         dp_rank,
                         &warning_count,
-                        &mut expanded_block_hashes,
                     );
                     if tx.send(event).is_err() {
                         tracing::warn!("Failed to send message to channel - receiver dropped");
@@ -574,7 +571,6 @@ fn convert_event(
     kv_block_size: u32,
     dp_rank: u32,
     warning_count: &Arc<AtomicU32>,
-    expanded_block_hashes: &mut HashMap<(u64, Option<String>), Vec<u64>>,
 ) -> KvCacheEvent {
     match raw {
         RawKvEvent::BlockStored {
@@ -587,7 +583,6 @@ fn convert_event(
             medium,
             ..
         } => {
-            let medium_key = normalize_medium_key(medium.as_deref());
             let num_blocks = block_hashes.len();
             let token_ids_len = token_ids.len();
             if medium
@@ -606,18 +601,9 @@ fn convert_event(
                 );
             }
             let original_parent_raw = parent_block_hash.map(BlockHashValue::into_i64);
-            let block_token_sizes = compute_block_token_sizes(num_blocks, block_size, token_ids_len);
-            let tokens_per_event_block = if num_blocks > 0 {
-                block_token_sizes[0]
-            } else {
-                block_size
-            };
-
-            let original_hashes: Vec<(u64, i64)> = block_hashes
-                .into_iter()
-                .map(|h| (h.into_u64(), h.into_i64()))
-                .collect();
             // LMCache may use 0 as a root sentinel. Treat it as "no parent".
+            // No raw->expanded mapping: trust the event's hash space as-is
+            // (matches v0.9.0 behavior).
             let parent_hash = parent_block_hash
                 .map(BlockHashValue::into_u64)
                 .and_then(|parent| {
@@ -626,150 +612,106 @@ fn convert_event(
                     } else {
                         Some(ExternalSequenceBlockHash::from(parent))
                     }
-                })
-                .map(|parent| {
-                    // Look up the expanded parent hash *strictly* in this
-                    // event's medium. A cross-medium fallback would let a GPU
-                    // BlockStored carry a CPU-medium parent hash that the
-                    // kv-mode indexer (which only stores GPU entries via
-                    // `should_store = use_strata_routing || is_gpu`) cannot
-                    // resolve, causing the store to be skipped with
-                    // "Failed to find parent block".
-                    expanded_block_hashes
-                        .get(&(parent.0, medium_key.clone()))
-                        .and_then(|expanded| expanded.last().copied())
-                        .map(ExternalSequenceBlockHash::from)
-                        .unwrap_or(parent)
                 });
+
+            let original_hashes: Vec<(u64, i64)> = block_hashes
+                .into_iter()
+                .map(|h| (h.into_u64(), h.into_i64()))
+                .collect();
 
             let mut blocks = Vec::new();
             let mut token_offset = 0usize;
             let mut geometry_mismatch = false;
+            let mut blocks_skipped = 0usize;
+
+            // Direct-trust semantics: one event block == one published block.
+            // If the per-block token count doesn't match kv_block_size we
+            // can't compute a meaningful tokens_hash, so skip that block
+            // (same behavior as v0.9.0's create_stored_blocks). Producers
+            // (vLLM, LMCache) are responsible for aligning their chunk
+            // size with the router's kv_block_size; users configure both
+            // explicitly via --kv-cache-block-size / --block-size.
+            let block_token_sizes = compute_block_token_sizes(num_blocks, block_size, token_ids_len);
             for (block_idx, (original_hash_u64, original_hash_i64)) in original_hashes.iter().enumerate() {
+                let this_block_tokens = *block_token_sizes.get(block_idx).unwrap_or(&0);
+
+                if this_block_tokens != kv_block_size as usize {
+                    blocks_skipped += 1;
+                    token_offset += this_block_tokens;
+                    continue;
+                }
+                if token_offset + this_block_tokens > token_ids.len() {
+                    geometry_mismatch = true;
+                    break;
+                }
+
+                let tokens = &token_ids[token_offset..token_offset + this_block_tokens];
+                token_offset += this_block_tokens;
+
                 let mm_extra_info = block_mm_infos
                     .as_deref()
                     .and_then(|infos| infos.get(block_idx))
                     .and_then(|opt| opt.clone());
-                let this_block_tokens = *block_token_sizes.get(block_idx).unwrap_or(&0);
-                let mut remaining = this_block_tokens;
-                let mut sub_idx = 0usize;
-                let mut expanded_hashes_for_block = Vec::new();
+                let mm_for_hash = mm_extra_info.as_ref().map(|info| vec![Some(info.clone())]);
+                let tokens_hash = compute_local_block_hash_with_optional_padding(
+                    tokens,
+                    kv_block_size,
+                    mm_for_hash.as_deref(),
+                );
+                let block_hash = ExternalSequenceBlockHash::from(*original_hash_u64);
 
-                while remaining > 0 {
-                    let take = remaining.min(kv_block_size as usize);
-                    let end = token_offset + take;
-                    if end > token_ids.len() {
-                        geometry_mismatch = true;
-                        break;
-                    }
-                    let tokens = &token_ids[token_offset..end];
-                    token_offset = end;
-                    remaining -= take;
+                tracing::debug!(
+                    "PUB_HASH: medium={:?} original_hash={} tok_len={} tokens_hash={} block_hash={} head={:?} tail={:?}",
+                    medium,
+                    *original_hash_i64,
+                    tokens.len(),
+                    tokens_hash.0,
+                    block_hash.0,
+                    tokens.iter().take(4).copied().collect::<Vec<u32>>(),
+                    tokens.iter().rev().take(4).rev().copied().collect::<Vec<u32>>(),
+                );
 
-                    let block_mm_infos = mm_extra_info.as_ref().map(|info| vec![Some(info.clone())]);
-                    let tokens_hash = compute_local_block_hash_with_optional_padding(
-                        tokens,
-                        kv_block_size,
-                        block_mm_infos.as_deref(),
-                    );
-                    let this_sub_idx = sub_idx as u32;
-                    let block_hash = derive_expanded_block_hash(*original_hash_u64, sub_idx, tokens_hash);
-                    // PUB_HASH diagnostic: dump enough to correlate against
-                    // META_STORE_CPU/META_READ_CXL from LMCache. Length, head/tail,
-                    // and the computed tokens_hash are sufficient to localize a
-                    // discrepancy on either side of the ZMQ wire.
-                    {
-                        let head: Vec<u32> = tokens.iter().take(4).copied().collect();
-                        let tail: Vec<u32> = tokens.iter().rev().take(4).rev().copied().collect();
-                        tracing::debug!(
-                            "PUB_HASH: medium={:?} original_hash={} sub_idx={} tok_len={} tokens_hash={} block_hash={} head={:?} tail={:?}",
-                            medium,
-                            *original_hash_i64,
-                            sub_idx,
-                            tokens.len(),
-                            tokens_hash.0,
-                            block_hash.0,
-                            head,
-                            tail,
-                        );
-                    }
-                    sub_idx += 1;
-                    expanded_hashes_for_block.push(block_hash.0);
-                    blocks.push(KvCacheStoredBlockData {
-                        block_hash,
-                        tokens_hash,
-                        mm_extra_info: mm_extra_info.clone(),
-                        medium: medium.clone(),
-                        original_hash: Some(*original_hash_i64),
-                        sub_idx: Some(this_sub_idx),
-                        parent_raw: original_parent_raw,
-                        parent_hash,
-                    });
-                }
-
-                if remaining > 0 {
-                    geometry_mismatch = true;
-                }
-                if expanded_hashes_for_block.is_empty() {
-                    expanded_block_hashes.remove(&(*original_hash_u64, medium_key.clone()));
-                } else {
-                    expanded_block_hashes.insert(
-                        (*original_hash_u64, medium_key.clone()),
-                        expanded_hashes_for_block,
-                    );
-                }
+                blocks.push(KvCacheStoredBlockData {
+                    block_hash,
+                    tokens_hash,
+                    mm_extra_info,
+                    medium: medium.clone(),
+                    original_hash: Some(*original_hash_i64),
+                    sub_idx: Some(0),
+                    parent_raw: original_parent_raw,
+                    parent_hash,
+                });
             }
             if token_offset < token_ids.len() {
                 geometry_mismatch = true;
             }
 
-            if geometry_mismatch && warning_count.fetch_add(1, Ordering::Relaxed) < 10 {
+            if (geometry_mismatch || blocks_skipped > 0)
+                && warning_count.fetch_add(1, Ordering::Relaxed) < 10
+            {
                 tracing::warn!(
-                    "KV BlockStored geometry mismatch while splitting (event_id={}, kv_block_size={}, event_block_size={}, first_block_tokens={}, num_blocks={}, token_ids_len={}, consumed_tokens={})",
+                    "KV BlockStored block-size mismatch (event_id={}, kv_block_size={}, event_block_size={}, num_blocks={}, token_ids_len={}, consumed_tokens={}, skipped={}). Producer block_size must equal router kv_block_size for the block to be published.",
                     event_id,
                     kv_block_size,
                     block_size,
-                    tokens_per_event_block,
                     num_blocks,
                     token_ids_len,
-                    token_offset
+                    token_offset,
+                    blocks_skipped,
                 );
             }
-            let conversion_path = if block_size == kv_block_size as usize {
-                "aligned"
-            } else {
-                "split_by_actual_token_len"
-            };
 
             if blocks.is_empty() {
                 tracing::warn!(
-                    "KV BlockStored converted to 0 blocks: event_id={}, dp_rank={}, path={}, raw_num_blocks={}, raw_token_ids_len={}, raw_block_size={}, inferred_tokens_per_event_block={}, medium={:?}, parent_raw={:?}, parent_mapped={:?}, first_hash={:?}",
+                    "KV BlockStored converted to 0 blocks: event_id={}, dp_rank={}, raw_num_blocks={}, raw_token_ids_len={}, raw_block_size={}, medium={:?}, parent_raw={:?}, first_hash={:?}",
                     event_id,
                     dp_rank,
-                    conversion_path,
                     num_blocks,
                     token_ids_len,
                     block_size,
-                    tokens_per_event_block,
                     medium,
                     original_parent_raw,
-                    parent_hash,
                     original_hashes.first().map(|(_, signed)| *signed),
-                );
-            } else {
-                tracing::debug!(
-                    "KV BlockStored converted: event_id={}, dp_rank={}, path={}, raw_num_blocks={}, raw_token_ids_len={}, raw_block_size={}, inferred_tokens_per_event_block={}, out_blocks={}, medium={:?}, parent_raw={:?}, parent_mapped={:?}",
-                    event_id,
-                    dp_rank,
-                    conversion_path,
-                    num_blocks,
-                    token_ids_len,
-                    block_size,
-                    tokens_per_event_block,
-                    blocks.len(),
-                    medium,
-                    original_parent_raw,
-                    parent_hash,
                 );
             }
 
@@ -785,7 +727,6 @@ fn convert_event(
         RawKvEvent::BlockRemoved {
             block_hashes, medium, ..
         } => {
-            let medium_key = normalize_medium_key(medium.as_deref());
             if medium.is_none() {
                 tracing::warn!(
                     "KV BlockRemoved missing medium: event_id={}, dp_rank={}, raw_num_blocks={}",
@@ -794,51 +735,12 @@ fn convert_event(
                     block_hashes.len(),
                 );
             }
-            // Keep conversion semantics aligned with BlockStored:
-            // preserve signed/unsigned interpretation for diagnostics while
-            // using u64 bit-pattern for lookup/removal mapping.
-            let original_hashes: Vec<(u64, i64)> = block_hashes
+            // Direct-trust semantics: the raw hash is the lookup key.
+            let hashes = block_hashes
                 .into_iter()
-                .map(|h| (h.into_u64(), h.into_i64()))
+                .map(BlockHashValue::into_u64)
+                .map(ExternalSequenceBlockHash::from)
                 .collect();
-            let mut hashes = Vec::new();
-            for (block_hash_u64, _) in original_hashes {
-                if let Some(expanded_hashes) =
-                    expanded_block_hashes.remove(&(block_hash_u64, medium_key.clone()))
-                {
-                    hashes.extend(expanded_hashes.into_iter().map(ExternalSequenceBlockHash::from));
-                    continue;
-                }
-
-                if medium_key.is_none() {
-                    let matching_keys: Vec<(u64, Option<String>)> = expanded_block_hashes
-                        .keys()
-                        .filter(|(raw_hash, _)| *raw_hash == block_hash_u64)
-                        .cloned()
-                        .collect();
-                    if !matching_keys.is_empty() {
-                        for key in matching_keys {
-                            if let Some(expanded_hashes) = expanded_block_hashes.remove(&key) {
-                                hashes.extend(
-                                    expanded_hashes
-                                        .into_iter()
-                                        .map(ExternalSequenceBlockHash::from),
-                                );
-                            }
-                        }
-                        continue;
-                    }
-                }
-
-                tracing::warn!(
-                    "KV BlockRemoved mapping miss: event_id={}, dp_rank={}, raw_hash={}, medium={:?}",
-                    event_id,
-                    dp_rank,
-                    block_hash_u64,
-                    medium_key,
-                );
-                hashes.push(ExternalSequenceBlockHash::from(block_hash_u64));
-            }
             KvCacheEvent {
                 event_id,
                 data: KvCacheEventData::Removed(KvCacheRemoveData {
@@ -848,19 +750,12 @@ fn convert_event(
                 dp_rank,
             }
         }
-        RawKvEvent::AllBlocksCleared => {
-            expanded_block_hashes.clear();
-            KvCacheEvent {
-                event_id,
-                data: KvCacheEventData::Cleared,
-                dp_rank,
-            }
-        }
+        RawKvEvent::AllBlocksCleared => KvCacheEvent {
+            event_id,
+            data: KvCacheEventData::Cleared,
+            dp_rank,
+        },
     }
-}
-
-fn normalize_medium_key(medium: Option<&str>) -> Option<String> {
-    medium.map(|m| m.to_ascii_uppercase())
 }
 
 fn compute_block_token_sizes(num_blocks: usize, block_size: usize, token_ids_len: usize) -> Vec<usize> {
@@ -905,18 +800,6 @@ fn compute_local_block_hash_with_optional_padding(
     padded.extend_from_slice(tokens);
     padded.resize(kv_block_size as usize, 0);
     compute_block_hash_for_seq(&padded, kv_block_size, block_mm_infos)[0]
-}
-
-fn derive_expanded_block_hash(
-    original_hash: u64,
-    sub_idx: usize,
-    tokens_hash: LocalBlockHash,
-) -> ExternalSequenceBlockHash {
-    let mix = original_hash
-        ^ tokens_hash.0.rotate_left(17)
-        ^ (sub_idx as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
-    let mixed = mix.wrapping_mul(0xbf58_476d_1ce4_e5b9).rotate_left(29);
-    ExternalSequenceBlockHash(mixed)
 }
 
 pub fn create_stored_block_from_parts(
@@ -1468,7 +1351,6 @@ mod test_event_processing {
     #[test]
     fn test_convert_event_block_stored() {
         let kv_block_size = 4;
-        let mut expanded_block_hashes = HashMap::new();
         let raw_evt = RawKvEvent::BlockStored {
             block_hashes: vec![BlockHashValue::Unsigned(10), BlockHashValue::Unsigned(11)],
             parent_block_hash: Some(BlockHashValue::Unsigned(99)),
@@ -1486,7 +1368,6 @@ mod test_event_processing {
             kv_block_size,
             0,
             &Arc::new(AtomicU32::new(0)),
-            &mut expanded_block_hashes,
         );
         assert!(matches!(out.data, KvCacheEventData::Stored(_)));
     }
@@ -1494,7 +1375,6 @@ mod test_event_processing {
     #[test]
     fn test_convert_event_block_removed() {
         let kv_block_size = 4;
-        let mut expanded_block_hashes = HashMap::new();
         let raw_evt = RawKvEvent::BlockRemoved {
             block_hashes: vec![BlockHashValue::Unsigned(123), BlockHashValue::Signed(456)],
             medium: None,
@@ -1505,7 +1385,6 @@ mod test_event_processing {
             kv_block_size,
             0,
             &Arc::new(AtomicU32::new(0)),
-            &mut expanded_block_hashes,
         );
 
         assert!(matches!(out.data, KvCacheEventData::Removed(_)));
@@ -1514,7 +1393,6 @@ mod test_event_processing {
     #[test]
     fn test_convert_event_all_blocks_cleared() {
         let kv_block_size = 4;
-        let mut expanded_block_hashes = HashMap::new();
         let raw_evt = RawKvEvent::AllBlocksCleared;
         let out = convert_event(
             raw_evt,
@@ -1522,15 +1400,16 @@ mod test_event_processing {
             kv_block_size,
             0,
             &Arc::new(AtomicU32::new(0)),
-            &mut expanded_block_hashes,
         );
         assert!(matches!(out.data, KvCacheEventData::Cleared));
     }
 
     #[test]
-    fn test_convert_event_expands_larger_blocks() {
+    fn test_convert_event_mismatched_block_size_skips() {
+        // Producer block_size (8) != router kv_block_size (4): blocks are
+        // skipped rather than split. This matches v0.9.0 semantics: blocks
+        // whose token count doesn't equal kv_block_size are unpublishable.
         let kv_block_size = 4;
-        let mut expanded_block_hashes = HashMap::new();
         let warning_count = Arc::new(AtomicU32::new(0));
 
         let raw_evt = RawKvEvent::BlockStored {
@@ -1550,14 +1429,45 @@ mod test_event_processing {
             kv_block_size,
             0,
             &warning_count,
-            &mut expanded_block_hashes,
         );
         let KvCacheEventData::Stored(store) = out.data else {
             panic!("expected stored event");
         };
-        assert_eq!(store.blocks.len(), 2);
+        assert_eq!(store.blocks.len(), 0);
+    }
+
+    #[test]
+    fn test_convert_event_aligned_uses_raw_hash() {
+        // Producer block_size == router kv_block_size: block is published
+        // with its raw hash as block_hash (no derive).
+        let kv_block_size = 4;
+        let warning_count = Arc::new(AtomicU32::new(0));
+
+        let raw_evt = RawKvEvent::BlockStored {
+            block_hashes: vec![BlockHashValue::Unsigned(1001)],
+            parent_block_hash: Some(BlockHashValue::Unsigned(42)),
+            token_ids: vec![1, 2, 3, 4],
+            block_size: 4,
+            lora_id: Some(0),
+            medium: Some("CPU".to_string()),
+            lora_name: None,
+            block_mm_infos: None,
+        };
+
+        let out = convert_event(
+            raw_evt,
+            7,
+            kv_block_size,
+            0,
+            &warning_count,
+        );
+        let KvCacheEventData::Stored(store) = out.data else {
+            panic!("expected stored event");
+        };
+        assert_eq!(store.blocks.len(), 1);
+        assert_eq!(store.blocks[0].block_hash.0, 1001);
+        assert_eq!(store.parent_hash.map(|p| p.0), Some(42));
         assert_eq!(store.blocks[0].medium.as_deref(), Some("CPU"));
-        assert!(expanded_block_hashes.contains_key(&1001));
     }
 }
 
