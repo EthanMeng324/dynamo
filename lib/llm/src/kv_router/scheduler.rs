@@ -580,49 +580,57 @@ impl WorkerSelector for DefaultWorkerSelector {
         let candidates = softmax_sample(&worker_logits, temperature);
 
         // If multiple candidates (tied), use tie-breaker.
-        // kv-strata: GPU match count, then CPU match count, then tree size.
-        // kv (original): tree size only.
+        // kv-strata and kv use the same tie-breaker (tree size only), matching
+        // v0.9.0's original behavior. kv-strata's per-tier weighting is already
+        // applied to the logit above (effective_overlap with cpu/cxl weights);
+        // the tie-breaker should not introduce an additional, opposite-direction
+        // bias relative to kv mode.
+        //
+        // Previously kv-strata had a different tie-breaker (kept here for
+        // reference) that picked the worker with the highest GPU/CPU match
+        // count, then the largest tree_size -- this concentrated requests onto
+        // already-hot workers and was the inverse of kv's "min tree_size"
+        // policy. Under temperature=0 + NATS publish lag, logit ties happen
+        // often enough that the two strategies produced markedly different
+        // CPU-tier hit rates between the two modes.
+        //
+        // Old kv-strata tie-breaker:
+        //     candidates.iter().max_by(|a, b| {
+        //         let gpu_a = request.overlaps.gpu_scores.get(a).copied().unwrap_or(0);
+        //         let gpu_b = request.overlaps.gpu_scores.get(b).copied().unwrap_or(0);
+        //         match gpu_a.cmp(&gpu_b) {
+        //             Equal => {
+        //                 let cpu_a = request.overlaps.cpu_scores.get(a).copied().unwrap_or(0);
+        //                 let cpu_b = request.overlaps.cpu_scores.get(b).copied().unwrap_or(0);
+        //                 match cpu_a.cmp(&cpu_b) {
+        //                     Equal => {
+        //                         let tree_a = request.overlaps.tree_sizes.get(a).copied().unwrap_or(0);
+        //                         let tree_b = request.overlaps.tree_sizes.get(b).copied().unwrap_or(0);
+        //                         tree_b.cmp(&tree_a)
+        //                     }
+        //                     other => other,
+        //                 }
+        //             }
+        //             other => other,
+        //         }
+        //     })
         let best_worker = if candidates.len() > 1 {
             if self.kv_router_config.use_strata_routing {
-                tracing::info!("Multiple workers tied with same logit, using GPU/CPU match counts and tree size as tie-breaker");
-                *candidates
-                    .iter()
-                    .max_by(|a, b| {
-                        let gpu_a = request.overlaps.gpu_scores.get(a).copied().unwrap_or(0);
-                        let gpu_b = request.overlaps.gpu_scores.get(b).copied().unwrap_or(0);
-                        match gpu_a.cmp(&gpu_b) {
-                            std::cmp::Ordering::Equal => {
-                                let cpu_a = request.overlaps.cpu_scores.get(a).copied().unwrap_or(0);
-                                let cpu_b = request.overlaps.cpu_scores.get(b).copied().unwrap_or(0);
-                                match cpu_a.cmp(&cpu_b) {
-                                    std::cmp::Ordering::Equal => {
-                                        let tree_a =
-                                            request.overlaps.tree_sizes.get(a).copied().unwrap_or(0);
-                                        let tree_b =
-                                            request.overlaps.tree_sizes.get(b).copied().unwrap_or(0);
-                                        tree_b.cmp(&tree_a)
-                                    }
-                                    other => other,
-                                }
-                            }
-                            other => other,
-                        }
-                    })
-                    .expect("candidates should not be empty")
+                // tracing::info!("Multiple workers tied with same logit, using tree size as tie-breaker (kv-strata mode)");
             } else {
-                tracing::info!("Multiple workers tied with same logit, using tree size as tie-breaker (kv mode)");
-                *candidates
-                    .iter()
-                    .min_by_key(|worker| {
-                        request
-                            .overlaps
-                            .tree_sizes
-                            .get(worker)
-                            .copied()
-                            .unwrap_or(0)
-                    })
-                    .expect("candidates should not be empty")
+                // tracing::info!("Multiple workers tied with same logit, using tree size as tie-breaker (kv mode)");
             }
+            *candidates
+                .iter()
+                .min_by_key(|worker| {
+                    request
+                        .overlaps
+                        .tree_sizes
+                        .get(worker)
+                        .copied()
+                        .unwrap_or(0)
+                })
+                .expect("candidates should not be empty")
         } else {
             candidates[0]
         };
