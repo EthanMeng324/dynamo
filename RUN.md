@@ -7,8 +7,9 @@ python -m dynamo.frontend --router-mode kv --router-reset-states
 CUDA_VISIBLE_DEVICES=0 \
 LMCACHE_CONFIG_FILE=lmcache.yaml \
 python -m dynamo.vllm \
-  --model Qwen/Qwen2.5-7B-Instruct \
-  --gpu-memory-utilization 0.8 \
+  --model /home/ucmerced/tmp/data/hf-cache/Qwen3-14B \
+  --served-model-name Qwen/Qwen3-14B \
+  --gpu-memory-utilization 0.9 \
   --connector lmcache \
   --kv-events-config '{"enable_kv_cache_events":"True","publisher":"zmq","topic":"kv-events"}'
 
@@ -29,8 +30,9 @@ sudo -E env CUDA_VISIBLE_DEVICES=0 \
 PYTHONHASHSEED=0 \
 LMCACHE_CONFIG_FILE=lmcache.yaml \
 ./venv/bin/python -m dynamo.vllm \
-  --model Qwen/Qwen2.5-7B-Instruct \
-  --gpu-memory-utilization 0.8 \
+  --model /home/ucmerced/tmp/data/hf-cache/Qwen3-14B \
+  --served-model-name Qwen/Qwen3-14B \
+  --gpu-memory-utilization 0.9 \
   --connector lmcache \
   --kv-events-config '{"enable_kv_cache_events":"True","publisher":"zmq","topic":"kv-events"}' \
   --block-size 256
@@ -39,8 +41,9 @@ sudo -E env CUDA_VISIBLE_DEVICES=0 \
 PYTHONHASHSEED=0 \
 LMCACHE_CONFIG_FILE=lmcache.yaml \
 ./venv/bin/python -m dynamo.vllm \
-  --model Qwen/Qwen2.5-7B-Instruct \
-  --gpu-memory-utilization 0.8 \
+  --model /home/ucm/tmp/data/hf-cache/Qwen3-14B \
+  --served-model-name Qwen/Qwen3-14B \
+  --gpu-memory-utilization 0.9 \
   --connector lmcache \
   --kv-events-config '{"enable_kv_cache_events":"True","publisher":"zmq","topic":"kv-events"}' \
   --block-size 256
@@ -48,7 +51,7 @@ LMCACHE_CONFIG_FILE=lmcache.yaml \
 curl http://localhost:8000/v1/completions \
 -H "Content-Type: application/json" \
 -d '{
-  "model": "Qwen/Qwen2.5-7B-Instruct",
+  "model": "Qwen/Qwen3-14B",
   "prompt": "<|begin_of_text|><|system|>\nYou are a helpful AI assistant.\n<|user|>\nWhat is the capital of France?\n<|assistant|>",
   "max_tokens": 100,
   "temperature": 0.7
@@ -57,7 +60,7 @@ curl http://localhost:8000/v1/completions \
 curl http://localhost:8000/v1/completions \
 -H "Content-Type: application/json" \
 -d '{
-  "model": "Qwen/Qwen2.5-7B-Instruct",
+  "model": "Qwen/Qwen3-14B",
   "prompt": "<|begin_of_text|><|system|>\nYou are a helpful AI assistant. You are careful, precise, and explain things clearly when needed. You always read the full context before answering.\n\n<|user|>\nI am going to ask you a very simple factual question, but before that, please carefully read the following background information. This background is provided to test your ability to process long context correctly.\n\nBackground section 1:\nFrance is a country located primarily in Western Europe, although it also has overseas regions and territories. It is known for its long history, cultural influence, cuisine, art, philosophy, and political thought. France has played a significant role in European and world history, including during the Roman period, the Middle Ages, the Renaissance, the Enlightenment, and the modern era.\n\nBackground section 2:\nThe political system of France is a semi-presidential republic. It has multiple large cities that are economically and culturally important. These cities include Paris, Lyon, Marseille, Toulouse, Nice, Nantes, Strasbourg, and others. Among these, one city serves as the seat of government, the main administrative center, and the symbolic heart of the nation.\n\nBackground section 3:\nWhen answering the question below, you should rely on well-established geographic and political knowledge. The answer should be concise and factual. Do not include unnecessary explanation unless explicitly requested.\n\nNow, based on all the information above, answer the following question:\n\nWhat is the capital of France?\n\n<|assistant|>",
   "max_tokens": 100,
   "temperature": 0.7

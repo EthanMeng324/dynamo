@@ -16,7 +16,7 @@ enable_kv_events: true
 
 # Save unfull chunks (chunks smaller than chunk_size)
 # This allows saving KV cache even when token count < chunk_size
-save_unfull_chunk: true
+save_unfull_chunk: false
 
 internal_api_server_enabled: true
 

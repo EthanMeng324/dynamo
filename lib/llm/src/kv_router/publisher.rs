@@ -660,17 +660,6 @@ fn convert_event(
                 );
                 let block_hash = ExternalSequenceBlockHash::from(*original_hash_u64);
 
-                tracing::debug!(
-                    "PUB_HASH: medium={:?} original_hash={} tok_len={} tokens_hash={} block_hash={} head={:?} tail={:?}",
-                    medium,
-                    *original_hash_i64,
-                    tokens.len(),
-                    tokens_hash.0,
-                    block_hash.0,
-                    tokens.iter().take(4).copied().collect::<Vec<u32>>(),
-                    tokens.iter().rev().take(4).rev().copied().collect::<Vec<u32>>(),
-                );
-
                 blocks.push(KvCacheStoredBlockData {
                     block_hash,
                     tokens_hash,
