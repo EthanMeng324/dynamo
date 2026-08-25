@@ -163,6 +163,135 @@ def parse_args():
         help="kv-strata only: weight (<=1.0) applied to CXL cache hits relative to GPU hits when scoring workers. Typically lower than --strata-cpu-overlap-weight. Ignored in 'kv' mode.",
     )
     parser.add_argument(
+        "--strata-prefetch-overlap-weight",
+        type=float,
+        default=float(os.environ.get("DYN_STRATA_PREFETCH_OVERLAP_WEIGHT", "0.5")),
+        help="kv-strata only: weight for blocks whose CXL-to-CPU prefetch is inflight.",
+    )
+    parser.add_argument(
+        "--strata-load-aware-shared-cpu",
+        action=argparse.BooleanOptionalAction,
+        default=(
+            os.environ.get("DYN_STRATA_LOAD_AWARE_SHARED_CPU", "false").lower()
+            == "true"
+        ),
+        help="kv-strata only: when a block exists in both local CPU and shared CXL, gradually relax the local CPU affinity as that worker's decode and prefill load rises. Disabled by default.",
+    )
+    parser.add_argument(
+        "--strata-randomize-ties",
+        action=argparse.BooleanOptionalAction,
+        default=(
+            os.environ.get("DYN_STRATA_RANDOMIZE_TIES", "false").lower() == "true"
+        ),
+        help="kv-strata only: randomly choose among workers with the same minimum route cost instead of using a deterministic tree-size tie break. Disabled by default.",
+    )
+    parser.add_argument(
+        "--background-offload",
+        action=argparse.BooleanOptionalAction,
+        default=os.environ.get("DYN_BACKGROUND_OFFLOAD_ENABLED", "false").lower()
+        == "true",
+        help="Enable the default-off periodic CPU-to-CXL offload planner.",
+    )
+    parser.add_argument(
+        "--background-offload-dry-run",
+        action=argparse.BooleanOptionalAction,
+        default=os.environ.get("DYN_BACKGROUND_OFFLOAD_DRY_RUN", "true").lower()
+        == "true",
+        help="Log periodic offload candidates without sending LMCache commands.",
+    )
+    parser.add_argument(
+        "--background-offload-interval-ms",
+        type=int,
+        default=int(os.environ.get("DYN_BACKGROUND_OFFLOAD_INTERVAL_MS", "5000")),
+    )
+    parser.add_argument(
+        "--background-offload-window-ms",
+        type=int,
+        default=int(os.environ.get("DYN_BACKGROUND_OFFLOAD_WINDOW_MS", "10000")),
+    )
+    parser.add_argument(
+        "--background-offload-hot-request-threshold",
+        type=int,
+        default=int(
+            os.environ.get("DYN_BACKGROUND_OFFLOAD_HOT_REQUEST_THRESHOLD", "5")
+        ),
+    )
+    parser.add_argument(
+        "--background-offload-owner-load-threshold",
+        type=int,
+        default=int(
+            os.environ.get("DYN_BACKGROUND_OFFLOAD_OWNER_LOAD_THRESHOLD", "10")
+        ),
+    )
+    parser.add_argument(
+        "--background-offload-top-k",
+        type=int,
+        default=int(os.environ.get("DYN_BACKGROUND_OFFLOAD_TOP_K", "100")),
+    )
+    parser.add_argument(
+        "--background-offload-max-chunks",
+        type=int,
+        default=int(os.environ.get("DYN_BACKGROUND_OFFLOAD_MAX_CHUNKS", "8")),
+    )
+    parser.add_argument(
+        "--background-offload-max-inflight",
+        type=int,
+        default=int(os.environ.get("DYN_BACKGROUND_OFFLOAD_MAX_INFLIGHT", "1")),
+        help="Legacy setting retained for compatibility; automatic offload is always single-concurrent.",
+    )
+    parser.add_argument(
+        "--background-offload-max-active-decode-blocks",
+        type=int,
+        default=int(
+            os.environ.get("DYN_BACKGROUND_OFFLOAD_MAX_ACTIVE_DECODE_BLOCKS", "16")
+        ),
+        help="Admission ceiling for aggregate active decode blocks before a background offload may start.",
+    )
+    parser.add_argument(
+        "--background-offload-max-pending-prefill-tokens",
+        type=int,
+        default=int(
+            os.environ.get("DYN_BACKGROUND_OFFLOAD_MAX_PENDING_PREFILL_TOKENS", "0")
+        ),
+        help="Admission ceiling for aggregate pending prefill tokens before a background offload may start.",
+    )
+    parser.add_argument(
+        "--background-offload-bytes-per-sec",
+        type=int,
+        default=int(
+            os.environ.get("DYN_BACKGROUND_OFFLOAD_BYTES_PER_SEC", str(64 * 1024 * 1024))
+        ),
+        help="Sustained background CPU-to-CXL write budget in bytes/sec; zero disables the limiter.",
+    )
+    parser.add_argument(
+        "--background-offload-chunk-bytes",
+        type=int,
+        default=int(
+            os.environ.get("DYN_BACKGROUND_OFFLOAD_CHUNK_BYTES", str(1024 * 1024))
+        ),
+        help="Conservative bytes-per-KV-chunk estimate used by the offload byte limiter.",
+    )
+    parser.add_argument(
+        "--background-offload-cooldown-secs",
+        type=int,
+        default=int(os.environ.get("DYN_BACKGROUND_OFFLOAD_COOLDOWN_SECS", "30")),
+    )
+    parser.add_argument(
+        "--lmcache-controller-endpoint",
+        default=os.environ.get("DYN_LMCACHE_CONTROLLER_ENDPOINT"),
+        help="LMCache controller ZMQ REQ/REP endpoint, e.g. tcp://controller:9000.",
+    )
+    parser.add_argument(
+        "--background-offload-instance-map",
+        default=os.environ.get("DYN_BACKGROUND_OFFLOAD_INSTANCE_MAP", ""),
+        help="Static worker-to-LMCache map, e.g. '0=instance-0,1=instance-1'.",
+    )
+    parser.add_argument(
+        "--background-offload-instance-template",
+        default=os.environ.get("DYN_BACKGROUND_OFFLOAD_INSTANCE_TEMPLATE"),
+        help="LMCache instance template with {worker_id} and optional {dp_rank}.",
+    )
+    parser.add_argument(
         "--kv-events",
         action=argparse.BooleanOptionalAction,
         dest="use_kv_events",
@@ -370,6 +499,33 @@ async def async_main():
         if prefix:
             os.environ["DYN_METRICS_PREFIX"] = flags.metrics_prefix
 
+    background_offload_env = {
+        "DYN_BACKGROUND_OFFLOAD_ENABLED": flags.background_offload,
+        "DYN_BACKGROUND_OFFLOAD_DRY_RUN": flags.background_offload_dry_run,
+        "DYN_BACKGROUND_OFFLOAD_INTERVAL_MS": flags.background_offload_interval_ms,
+        "DYN_BACKGROUND_OFFLOAD_WINDOW_MS": flags.background_offload_window_ms,
+        "DYN_BACKGROUND_OFFLOAD_HOT_REQUEST_THRESHOLD": flags.background_offload_hot_request_threshold,
+        "DYN_BACKGROUND_OFFLOAD_OWNER_LOAD_THRESHOLD": flags.background_offload_owner_load_threshold,
+        "DYN_BACKGROUND_OFFLOAD_TOP_K": flags.background_offload_top_k,
+        "DYN_BACKGROUND_OFFLOAD_MAX_CHUNKS": flags.background_offload_max_chunks,
+        "DYN_BACKGROUND_OFFLOAD_MAX_INFLIGHT": flags.background_offload_max_inflight,
+        "DYN_BACKGROUND_OFFLOAD_MAX_ACTIVE_DECODE_BLOCKS": flags.background_offload_max_active_decode_blocks,
+        "DYN_BACKGROUND_OFFLOAD_MAX_PENDING_PREFILL_TOKENS": flags.background_offload_max_pending_prefill_tokens,
+        "DYN_BACKGROUND_OFFLOAD_BYTES_PER_SEC": flags.background_offload_bytes_per_sec,
+        "DYN_BACKGROUND_OFFLOAD_CHUNK_BYTES": flags.background_offload_chunk_bytes,
+        "DYN_BACKGROUND_OFFLOAD_COOLDOWN_SECS": flags.background_offload_cooldown_secs,
+        "DYN_LMCACHE_CONTROLLER_ENDPOINT": flags.lmcache_controller_endpoint,
+        "DYN_BACKGROUND_OFFLOAD_INSTANCE_MAP": flags.background_offload_instance_map,
+        "DYN_BACKGROUND_OFFLOAD_INSTANCE_TEMPLATE": flags.background_offload_instance_template,
+    }
+    for name, value in background_offload_env.items():
+        if value is None:
+            os.environ.pop(name, None)
+        elif isinstance(value, bool):
+            os.environ[name] = str(value).lower()
+        else:
+            os.environ[name] = str(value)
+
     # NATS is needed when:
     # 1. Request plane is NATS, OR
     # 2. Event plane is NATS AND KV router mode (kv or kv-strata) AND (KV events OR replica sync enabled)
@@ -407,6 +563,19 @@ async def async_main():
             use_strata_routing=use_strata_routing,
             strata_cpu_overlap_weight=flags.strata_cpu_overlap_weight,
             strata_cxl_overlap_weight=flags.strata_cxl_overlap_weight,
+            strata_prefetch_overlap_weight=flags.strata_prefetch_overlap_weight,
+            strata_load_aware_shared_cpu=flags.strata_load_aware_shared_cpu,
+            strata_randomize_ties=flags.strata_randomize_ties,
+            enable_background_offload=flags.background_offload,
+            background_offload_dry_run=flags.background_offload_dry_run,
+            offload_interval_ms=flags.background_offload_interval_ms,
+            offload_window_ms=flags.background_offload_window_ms,
+            offload_hot_request_threshold=flags.background_offload_hot_request_threshold,
+            offload_owner_load_threshold=flags.background_offload_owner_load_threshold,
+            offload_top_k=flags.background_offload_top_k,
+            offload_max_chunks=flags.background_offload_max_chunks,
+            offload_max_inflight=flags.background_offload_max_inflight,
+            offload_cooldown_secs=flags.background_offload_cooldown_secs,
         )
     elif flags.router_mode == "random":
         router_mode = RouterMode.Random

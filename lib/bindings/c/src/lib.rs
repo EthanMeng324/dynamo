@@ -523,6 +523,19 @@ pub unsafe extern "C" fn dynamo_create_worker_selection_pipeline(
                 None, // use_strata_routing - C API uses kv mode
                 None, // strata_cpu_overlap_weight - unused in kv mode
                 None, // strata_cxl_overlap_weight - unused in kv mode
+                None, // strata_prefetch_overlap_weight - unused in kv mode
+                None, // strata_load_aware_shared_cpu - unused in kv mode
+                None, // strata_randomize_ties - unused in kv mode
+                None, // enable_background_offload - configured by frontend
+                None, // background_offload_dry_run
+                None, // offload_interval_ms
+                None, // offload_window_ms
+                None, // offload_hot_request_threshold
+                None, // offload_owner_load_threshold
+                None, // offload_top_k
+                None, // offload_max_chunks
+                None, // offload_max_inflight
+                None, // offload_cooldown_secs
             ))
         } else {
             None

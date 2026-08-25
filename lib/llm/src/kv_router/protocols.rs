@@ -172,14 +172,14 @@ pub struct ActiveLoad {
 
 /// A [`LocalBlockHash`] is a hash computed from the tokens_ids, extra_token_ids and the optional
 /// lora_id of a block.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Ord, PartialOrd)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Ord, PartialOrd, Default)]
 pub struct LocalBlockHash(pub u64);
 
 /// A sequence aware hash of a block where the hash is computed from the tokens_ids, extra_token_ids
 /// and the optional lora_id of a block, PLUS the hash of the parent block.
 ///
 /// In this case, the hashing function is external and unknown.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Ord, PartialOrd)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Ord, PartialOrd, Default)]
 pub struct ExternalSequenceBlockHash(pub u64);
 
 // Implement From trait for convenient conversion
@@ -395,7 +395,7 @@ impl RequestExtraInfo {
 }
 
 /// Represents data for a stored block.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
 pub struct KvCacheStoredBlockData {
     /// The hash of the block.
     pub block_hash: ExternalSequenceBlockHash,
@@ -424,7 +424,7 @@ pub struct KvCacheStoredBlockData {
 }
 
 /// Represents the data associated with a removed cache event.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
 pub struct KvCacheRemoveData {
     /// A list of block hashes to remove.
     pub block_hashes: Vec<ExternalSequenceBlockHash>,
@@ -605,6 +605,7 @@ mod tests {
                 block_hash: ExternalSequenceBlockHash(2),
                 tokens_hash: LocalBlockHash(3),
                 mm_extra_info: None,
+                ..Default::default()
             }],
         });
 
@@ -639,6 +640,7 @@ mod tests {
     fn test_kv_cache_remove_data_serialization() {
         let remove_data = KvCacheRemoveData {
             block_hashes: vec![ExternalSequenceBlockHash(4), ExternalSequenceBlockHash(5)],
+            medium: None,
         };
 
         let serialized = serde_json::to_string(&remove_data).unwrap();

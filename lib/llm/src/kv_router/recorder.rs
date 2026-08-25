@@ -25,6 +25,7 @@ mod tests {
                 tokens_hash: LocalBlockHash(*i),
                 block_hash: ExternalSequenceBlockHash(*i * 100),
                 mm_extra_info: None,
+                ..Default::default()
             })
             .collect()
     }
@@ -65,6 +66,7 @@ mod tests {
                         .iter()
                         .map(|i| ExternalSequenceBlockHash(*i * 100))
                         .collect(),
+                    medium: None,
                 }),
                 dp_rank: 0,
             },

@@ -534,6 +534,7 @@ mod tests {
             nvext: None,
             chat_template_args: None,
             media_io_kwargs: None,
+            kv_transfer_params: None,
             unsupported_fields: Default::default(),
         }
     }

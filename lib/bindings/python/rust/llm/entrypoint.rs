@@ -50,7 +50,7 @@ impl KvRouterConfig {
 #[pymethods]
 impl KvRouterConfig {
     #[new]
-    #[pyo3(signature = (overlap_score_weight=1.0, router_temperature=0.0, use_kv_events=true, router_replica_sync=false, router_track_active_blocks=true, router_track_output_blocks=false, router_assume_kv_reuse=true, router_snapshot_threshold=1000000, router_reset_states=false, router_ttl_secs=120.0, router_max_tree_size=1048576, router_prune_target_ratio=0.8, use_strata_routing=false, strata_cpu_overlap_weight=0.9, strata_cxl_overlap_weight=0.8))]
+    #[pyo3(signature = (overlap_score_weight=1.0, router_temperature=0.0, use_kv_events=true, router_replica_sync=false, router_track_active_blocks=true, router_track_output_blocks=false, router_assume_kv_reuse=true, router_snapshot_threshold=1000000, router_reset_states=false, router_ttl_secs=120.0, router_max_tree_size=1048576, router_prune_target_ratio=0.8, use_strata_routing=false, strata_cpu_overlap_weight=0.9, strata_cxl_overlap_weight=0.8, strata_prefetch_overlap_weight=0.5, strata_load_aware_shared_cpu=false, strata_randomize_ties=false, enable_background_offload=false, background_offload_dry_run=true, offload_interval_ms=5000, offload_window_ms=10000, offload_hot_request_threshold=5, offload_owner_load_threshold=10, offload_top_k=100, offload_max_chunks=8, offload_max_inflight=2, offload_cooldown_secs=30))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         overlap_score_weight: f64,
@@ -68,6 +68,19 @@ impl KvRouterConfig {
         use_strata_routing: bool,
         strata_cpu_overlap_weight: f64,
         strata_cxl_overlap_weight: f64,
+        strata_prefetch_overlap_weight: f64,
+        strata_load_aware_shared_cpu: bool,
+        strata_randomize_ties: bool,
+        enable_background_offload: bool,
+        background_offload_dry_run: bool,
+        offload_interval_ms: u64,
+        offload_window_ms: u64,
+        offload_hot_request_threshold: u32,
+        offload_owner_load_threshold: u64,
+        offload_top_k: usize,
+        offload_max_chunks: usize,
+        offload_max_inflight: usize,
+        offload_cooldown_secs: u64,
     ) -> Self {
         KvRouterConfig {
             inner: RsKvRouterConfig {
@@ -86,6 +99,19 @@ impl KvRouterConfig {
                 use_strata_routing,
                 strata_cpu_overlap_weight,
                 strata_cxl_overlap_weight,
+                strata_prefetch_overlap_weight,
+                strata_load_aware_shared_cpu,
+                strata_randomize_ties,
+                enable_background_offload,
+                background_offload_dry_run,
+                offload_interval_ms,
+                offload_window_ms,
+                offload_hot_request_threshold,
+                offload_owner_load_threshold,
+                offload_top_k,
+                offload_max_chunks,
+                offload_max_inflight,
+                offload_cooldown_secs,
             },
         }
     }
