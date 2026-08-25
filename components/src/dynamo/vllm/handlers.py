@@ -45,6 +45,18 @@ DECODED_VARIANT_KEY: Final = "Decoded"
 configure_dynamo_logging()
 logger = logging.getLogger(__name__)
 
+
+def _positive_env_int(name: str, default: int, alias: str | None = None) -> int:
+    """Read a positive integer setting without making endpoint startup fragile."""
+    raw_value = os.environ.get(name)
+    if raw_value is None and alias is not None:
+        raw_value = os.environ.get(alias)
+    try:
+        return max(1, int(raw_value)) if raw_value is not None else default
+    except (TypeError, ValueError):
+        return default
+
+
 # LoRAManager singleton - initialized lazily when DYN_LORA_ENABLED is set
 # None = not yet initialized, False = disabled/failed, LoRAManager = initialized
 _lora_manager = None
@@ -276,6 +288,29 @@ class BaseWorkerHandler(ABC):
         # Store shutdown event for graceful shutdown monitoring
         self.shutdown_event = shutdown_event
 
+        # Waiting-route CXL hints are deliberately admitted through a separate,
+        # bounded queue.  The endpoint only enqueues and returns; a single
+        # background consumer performs the vLLM collective RPC so a hint never
+        # occupies the request handler while waiting for EngineCore.
+        self._cxl_prefetch_queue: asyncio.Queue[
+            tuple[str, list[int], int, int, list[int], str, dict[str, Any]]
+        ] = (
+            asyncio.Queue(
+                maxsize=_positive_env_int(
+                    "DYN_CXL_PREFETCH_QUEUE_CAPACITY",
+                    8,
+                )
+            )
+        )
+        self._cxl_prefetch_worker_task: asyncio.Task | None = None
+        self._cxl_prefetch_rpc_timeout_s = (
+            _positive_env_int(
+                "DYN_CXL_PREFETCH_WORKER_RPC_TIMEOUT_MS",
+                100,
+            )
+            / 1000.0
+        )
+
     async def sleep(self, body: dict) -> dict:
         """Sleep the engine to release GPU memory and unregister from discovery.
 
@@ -414,6 +449,207 @@ class BaseWorkerHandler(ABC):
             yield {"status": "success", "message": "KV cache cleared"}
         except Exception as e:
             yield {"status": "error", "message": str(e)}
+
+    def _ensure_cxl_prefetch_worker(self) -> None:
+        task = self._cxl_prefetch_worker_task
+        if task is None or task.done():
+            self._cxl_prefetch_worker_task = asyncio.create_task(
+                self._run_cxl_prefetch_queue(),
+                name="dynamo-cxl-prefetch-worker",
+            )
+
+    async def _run_cxl_prefetch_queue(self) -> None:
+        """Drain speculative hints independently from request endpoints."""
+        while True:
+            (
+                request_id,
+                token_ids,
+                dp_rank,
+                max_chunks,
+                candidate_block_indices,
+                prefetch_kind,
+                trace,
+            ) = await self._cxl_prefetch_queue.get()
+            try:
+                if self.shutdown_event is not None and self.shutdown_event.is_set():
+                    continue
+
+                # Give foreground request processing a scheduling opportunity
+                # before touching the shared EngineCore control path.
+                await asyncio.sleep(0)
+
+                results = await asyncio.wait_for(
+                    self.engine_client.collective_rpc(
+                        # The method is installed through vLLM's worker
+                        # extension class.  Using its name keeps the request
+                        # on the safe EngineCore serializer path.
+                        "cxl_prefetch",
+                        args=(
+                            request_id,
+                            token_ids,
+                            dp_rank,
+                            max_chunks,
+                            candidate_block_indices,
+                        ),
+                    ),
+                    timeout=self._cxl_prefetch_rpc_timeout_s,
+                )
+                scheduled = sum(
+                    int(result.get("scheduled", 0))
+                    for result in results
+                    if isinstance(result, dict)
+                )
+                statuses = [
+                    str(result.get("status"))
+                    for result in results
+                    if isinstance(result, dict) and result.get("status") is not None
+                ]
+                stats = [
+                    result.get("prefetch_stats")
+                    for result in results
+                    if isinstance(result, dict) and result.get("prefetch_stats")
+                ]
+                worker_rpc_return_unix_ns = time.time_ns()
+                if os.environ.get("DYN_CXL_PREFETCH_TIMELINE_ENABLED", "").lower() in {
+                    "1",
+                    "true",
+                    "yes",
+                    "on",
+                }:
+                    logger.info(
+                        "CXL prefetch timeline worker_rpc_return "
+                        "request_id=%s source=%s worker_rpc_return_unix_ns=%d "
+                        "scheduled=%d statuses=%s route_enqueued_unix_ns=%s "
+                        "lookahead_admitted_unix_ns=%s queue_depth=%s "
+                        "worker_received_unix_ns=%s",
+                        request_id,
+                        prefetch_kind,
+                        worker_rpc_return_unix_ns,
+                        scheduled,
+                        statuses,
+                        trace.get("route_enqueued_unix_ns"),
+                        trace.get("lookahead_admitted_unix_ns"),
+                        trace.get("lookahead_queue_depth"),
+                        trace.get("worker_received_unix_ns"),
+                    )
+                message = (
+                    "%s CXL prefetch hint admitted for %s "
+                    "(scheduled=%d, statuses=%s, stats=%s)"
+                )
+                if scheduled or any(
+                    status not in {"accepted", "already_cpu"} for status in statuses
+                ):
+                    logger.info(
+                        message,
+                        prefetch_kind,
+                        request_id,
+                        scheduled,
+                        statuses,
+                        stats,
+                    )
+                else:
+                    logger.debug(
+                        message,
+                        prefetch_kind,
+                        request_id,
+                        scheduled,
+                        statuses,
+                        stats,
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                # Speculative work is fail-open.  A slow/dead engine or a
+                # missing LMCache installation must not affect generation.
+                logger.debug(
+                    "%s CXL prefetch background submission failed for %s: %s",
+                    prefetch_kind,
+                    request_id,
+                    e,
+                )
+            finally:
+                self._cxl_prefetch_queue.task_done()
+
+    async def cxl_prefetch(self, request=None, context=None):
+        """Queue a best-effort CXL-to-CPU hint and return immediately.
+
+        The actual collective RPC is handled by a bounded, single-consumer
+        background queue.  This endpoint never waits for EngineCore or the
+        CXL/CPU copy, and drops hints when the queue is full.
+        """
+        try:
+            request = request or {}
+            request_id = str(request.get("request_id", ""))
+            token_ids = [int(token) for token in request.get("token_ids", [])]
+            dp_rank = int(request.get("dp_rank", 0))
+            max_chunks = max(0, int(request.get("max_chunks", 0)))
+            candidate_block_indices = sorted(
+                {
+                    max(0, int(index))
+                    for index in request.get("candidate_block_indices", [])
+                }
+            )
+            prefetch_kind = str(
+                request.get("prefetch_kind", "dynamo_queue_lookahead")
+            )
+            worker_received_unix_ns = time.time_ns()
+            trace = {
+                "route_enqueued_unix_ns": request.get("route_enqueued_unix_ns"),
+                "lookahead_admitted_unix_ns": request.get(
+                    "lookahead_admitted_unix_ns"
+                ),
+                "lookahead_queue_depth": request.get("lookahead_queue_depth"),
+                "worker_received_unix_ns": worker_received_unix_ns,
+            }
+
+            self._ensure_cxl_prefetch_worker()
+            try:
+                self._cxl_prefetch_queue.put_nowait(
+                    (
+                        request_id,
+                        token_ids,
+                        dp_rank,
+                        max_chunks,
+                        candidate_block_indices,
+                        prefetch_kind,
+                        trace,
+                    )
+                )
+            except asyncio.QueueFull:
+                yield {
+                    "status": "dropped",
+                    "reason": "queue_full",
+                    "request_id": request_id,
+                }
+                return
+
+            if os.environ.get("DYN_CXL_PREFETCH_TIMELINE_ENABLED", "").lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }:
+                logger.info(
+                    "CXL prefetch timeline worker_receive request_id=%s "
+                    "source=%s worker_received_unix_ns=%d "
+                    "route_enqueued_unix_ns=%s lookahead_admitted_unix_ns=%s "
+                    "queue_depth=%s",
+                    request_id,
+                    prefetch_kind,
+                    worker_received_unix_ns,
+                    trace["route_enqueued_unix_ns"],
+                    trace["lookahead_admitted_unix_ns"],
+                    trace["lookahead_queue_depth"],
+                )
+            yield {
+                "status": "queued",
+                "request_id": request_id,
+                "queue_depth": self._cxl_prefetch_queue.qsize(),
+                "worker_received_unix_ns": worker_received_unix_ns,
+            }
+        except Exception as e:
+            logger.debug("CXL prefetch queue admission failed: %s", e)
+            yield {"status": "failed", "message": str(e)}
 
     def add_temp_dir(self, temp_dir: tempfile.TemporaryDirectory) -> None:
         """Add a temporary directory to be cleaned up later."""
@@ -788,6 +1024,17 @@ class BaseWorkerHandler(ABC):
 
     def cleanup(self):
         """Clean up resources including temporary directories."""
+        if self._cxl_prefetch_worker_task is not None:
+            self._cxl_prefetch_worker_task.cancel()
+            self._cxl_prefetch_worker_task = None
+        while True:
+            try:
+                self._cxl_prefetch_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            else:
+                self._cxl_prefetch_queue.task_done()
+
         for temp_dir in self.temp_dirs:
             try:
                 temp_dir.cleanup()

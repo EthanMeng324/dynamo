@@ -1781,6 +1781,7 @@ mod tests {
             nvext: None,
             chat_template_args: None,
             media_io_kwargs: None,
+            kv_transfer_params: None,
             unsupported_fields: Default::default(),
         };
         let result = validate_chat_completion_required_fields(&request);
@@ -1813,6 +1814,7 @@ mod tests {
             nvext: None,
             chat_template_args: None,
             media_io_kwargs: None,
+            kv_transfer_params: None,
             unsupported_fields: Default::default(),
         };
         let result = validate_chat_completion_required_fields(&request);
@@ -1850,6 +1852,7 @@ mod tests {
             common: Default::default(),
             nvext: None,
             metadata: None,
+            kv_transfer_params: None,
             unsupported_fields: Default::default(),
         };
 
@@ -1874,6 +1877,7 @@ mod tests {
             common: Default::default(),
             nvext: None,
             metadata: None,
+            kv_transfer_params: None,
             unsupported_fields: Default::default(),
         };
         let result = validate_completion_fields_generic(&request);
@@ -1897,6 +1901,7 @@ mod tests {
             common: Default::default(),
             nvext: None,
             metadata: None,
+            kv_transfer_params: None,
             unsupported_fields: Default::default(),
         };
         let result = validate_completion_fields_generic(&request);
@@ -1920,6 +1925,7 @@ mod tests {
             common: Default::default(),
             nvext: None,
             metadata: None,
+            kv_transfer_params: None,
             unsupported_fields: Default::default(),
         };
         let result = validate_completion_fields_generic(&request);
@@ -1945,6 +1951,7 @@ mod tests {
                 .unwrap(),
             nvext: None,
             metadata: None,
+            kv_transfer_params: None,
             unsupported_fields: Default::default(),
         };
         let result = validate_completion_fields_generic(&request);
@@ -1968,6 +1975,7 @@ mod tests {
             common: Default::default(),
             nvext: None,
             metadata: None,
+            kv_transfer_params: None,
             unsupported_fields: Default::default(),
         };
         let result = validate_completion_fields_generic(&request);
@@ -1999,6 +2007,7 @@ mod tests {
                 "session": {"id": "session-1", "timestamp": 1640995200}
             })
             .into(),
+            kv_transfer_params: None,
             unsupported_fields: Default::default(),
         };
 
@@ -2029,6 +2038,7 @@ mod tests {
             nvext: None,
             chat_template_args: None,
             media_io_kwargs: None,
+            kv_transfer_params: None,
             unsupported_fields: Default::default(),
         };
 
@@ -2059,6 +2069,7 @@ mod tests {
             nvext: None,
             chat_template_args: None,
             media_io_kwargs: None,
+            kv_transfer_params: None,
             unsupported_fields: Default::default(),
         };
         let result = validate_chat_completion_fields_generic(&request);
@@ -2088,6 +2099,7 @@ mod tests {
             nvext: None,
             chat_template_args: None,
             media_io_kwargs: None,
+            kv_transfer_params: None,
             unsupported_fields: Default::default(),
         };
         let result = validate_chat_completion_fields_generic(&request);
@@ -2117,6 +2129,7 @@ mod tests {
             nvext: None,
             chat_template_args: None,
             media_io_kwargs: None,
+            kv_transfer_params: None,
             unsupported_fields: Default::default(),
         };
         let result = validate_chat_completion_fields_generic(&request);
@@ -2148,6 +2161,7 @@ mod tests {
             nvext: None,
             chat_template_args: None,
             media_io_kwargs: None,
+            kv_transfer_params: None,
             unsupported_fields: Default::default(),
         };
         let result = validate_chat_completion_fields_generic(&request);
@@ -2177,6 +2191,7 @@ mod tests {
             nvext: None,
             chat_template_args: None,
             media_io_kwargs: None,
+            kv_transfer_params: None,
             unsupported_fields: Default::default(),
         };
         let result = validate_chat_completion_fields_generic(&request);
@@ -2226,6 +2241,25 @@ mod tests {
     }
 
     #[test]
+    fn test_chat_completions_accept_kv_transfer_params() {
+        let json = r#"{
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "kv_transfer_params": {
+                "lmcache.session_id": "session-42"
+            }
+        }"#;
+
+        let request: NvCreateChatCompletionRequest = serde_json::from_str(json).unwrap();
+        assert!(request.unsupported_fields.is_empty());
+        assert_eq!(
+            request.kv_transfer_params,
+            Some(serde_json::json!({"lmcache.session_id": "session-42"}))
+        );
+        assert!(validate_chat_completion_fields_generic(&request).is_ok());
+    }
+
+    #[test]
     fn test_completions_unsupported_fields_rejected() {
         // Test that known unsupported fields are rejected and all shown in error message
         let json = r#"{
@@ -2255,6 +2289,25 @@ mod tests {
             assert!(msg.contains("add_special_tokens"));
             assert!(msg.contains("response_format"));
         }
+    }
+
+    #[test]
+    fn test_completions_accept_kv_transfer_params() {
+        let json = r#"{
+            "model": "test-model",
+            "prompt": "Hello",
+            "kv_transfer_params": {
+                "lmcache.session_id": "session-42"
+            }
+        }"#;
+
+        let request: NvCreateCompletionRequest = serde_json::from_str(json).unwrap();
+        assert!(request.unsupported_fields.is_empty());
+        assert_eq!(
+            request.kv_transfer_params,
+            Some(serde_json::json!({"lmcache.session_id": "session-42"}))
+        );
+        assert!(validate_completion_fields_generic(&request).is_ok());
     }
 
     #[tokio::test]

@@ -52,6 +52,16 @@ pub enum PromptInput {
 pub trait OAIChatLikeRequest {
     fn model(&self) -> String;
     fn messages(&self) -> Value;
+
+    /// Additional request arguments that must reach the backend worker.
+    ///
+    /// These are kept separate from chat-template arguments: template
+    /// arguments affect prompt rendering, while backend arguments (such as
+    /// LMCache's `kv_transfer_params`) affect request execution.
+    fn extra_args(&self) -> Option<serde_json::Value> {
+        None
+    }
+
     fn typed_messages(
         &self,
     ) -> Option<&[dynamo_async_openai::types::ChatCompletionRequestMessage]> {

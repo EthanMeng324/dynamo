@@ -9,16 +9,18 @@ use dynamo_runtime::traits::DistributedRuntimeProvider;
 use dynamo_runtime::transports::event_plane::EventPublisher;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::env;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use super::KV_HIT_RATE_SUBJECT;
 use super::KvRouterConfig;
 use super::RouterConfigOverride;
 use super::WorkerSelector;
-use super::indexer::OverlapScores;
-use super::protocols::{DpRank, WorkerId, WorkerSelectionResult, WorkerWithDpRank};
+use super::indexer::{BlockResidencyMetadata, OverlapScores};
+use super::prefetch::{CxlPrefetchClient, PrefetchTrace};
+use super::protocols::{DpRank, LocalBlockHash, WorkerId, WorkerSelectionResult, WorkerWithDpRank};
 use super::sequence::{ActiveSequencesMultiWorker, SequenceError};
 
 use crate::tokens::SequenceHash;
@@ -59,6 +61,11 @@ pub enum KvSchedulerError {
 pub struct SchedulingResponse {
     pub best_worker: WorkerWithDpRank,
     pub overlap_blocks: u32,
+    /// Snapshot consumed by the default-off background offload planner.  It
+    /// is captured before the request is inserted into active scheduler
+    /// state.
+    pub decode_blocks: HashMap<WorkerWithDpRank, usize>,
+    pub prefill_tokens: HashMap<WorkerWithDpRank, usize>,
 }
 
 pub struct SchedulingRequest {
@@ -72,21 +79,60 @@ pub struct SchedulingRequest {
     pub router_config_override: Option<RouterConfigOverride>,
     // Whether to update scheduler states (false for query_instance_id requests)
     pub update_states: bool,
+    /// Raw prompt tokens are carried only when Dynamo queue lookahead is
+    /// enabled. The scheduler needs them because `token_seq` contains hashes,
+    /// not the token IDs that LMCache uses to build CXL keys.
+    pub prefetch_token_ids: Option<Vec<u32>>,
+    /// Prevent repeated speculative dispatch while this request remains in
+    /// the bounded waiting queue.
+    pub(crate) lookahead_dispatched: bool,
+    /// Monotonic and wall-clock enqueue timestamps used by the optional
+    /// request-level route/prefetch timeline.
+    pub(crate) enqueued_at: Instant,
+    pub(crate) enqueued_unix_ns: u128,
+    pub(crate) lookahead_admitted_at: Option<Instant>,
+    pub(crate) lookahead_admitted_unix_ns: Option<u128>,
+    pub(crate) lookahead_predicted_worker: Option<WorkerWithDpRank>,
     // Option to take it out to send the response without moving the struct
     resp_tx: Option<tokio::sync::oneshot::Sender<SchedulingResponse>>,
 }
 
 impl SchedulingRequest {
-    pub fn respond(&mut self, response: SchedulingResponse) {
-        // Changed to &mut self
+    /// Create a sender-free copy for speculative worker selection.  The
+    /// authoritative request remains untouched so virtual residency/load is
+    /// never reported as a real cache hit or route event.
+    fn planning_clone(&self) -> Self {
+        Self {
+            maybe_request_id: self.maybe_request_id.clone(),
+            token_seq: self.token_seq.clone(),
+            isl_tokens: self.isl_tokens,
+            overlaps: self.overlaps.clone(),
+            decode_blocks: self.decode_blocks.clone(),
+            prefill_tokens: self.prefill_tokens.clone(),
+            router_config_override: self.router_config_override.clone(),
+            update_states: self.update_states,
+            prefetch_token_ids: self.prefetch_token_ids.clone(),
+            lookahead_dispatched: self.lookahead_dispatched,
+            enqueued_at: self.enqueued_at,
+            enqueued_unix_ns: self.enqueued_unix_ns,
+            lookahead_admitted_at: self.lookahead_admitted_at,
+            lookahead_admitted_unix_ns: self.lookahead_admitted_unix_ns,
+            lookahead_predicted_worker: self.lookahead_predicted_worker,
+            resp_tx: None,
+        }
+    }
+
+    pub fn respond(&mut self, response: SchedulingResponse) -> bool {
         if let Some(tx) = self.resp_tx.take() {
-            // Use take() to extract the sender
             if tx.send(response).is_err() {
                 tracing::error!("failed to send response to requestor");
+                return false;
             }
+            return true;
         } else {
             tracing::error!("respond called multiple times on same request");
         }
+        false
     }
 }
 
@@ -95,12 +141,270 @@ pub struct KvScheduler {
     slots: Arc<ActiveSequencesMultiWorker>,
 }
 
+/// A bounded speculative view used while a waiting-route window is being
+/// planned.  The router/indexer remains authoritative; this overlay only
+/// models work that has been admitted to the CXL prefetch queue but has not
+/// produced a real LMCache event yet.
+///
+/// The virtual load is removed when the corresponding request is actually
+/// routed, while block reservations survive until their short TTL expires.
+/// This makes the next window start from fresh request overlap metadata without
+/// immediately re-issuing a still-in-flight promotion.
+#[derive(Debug, Clone)]
+struct OverlayReservation {
+    expires_at: Instant,
+}
+
+#[derive(Debug, Clone)]
+struct SpeculativeRequestState {
+    worker: WorkerWithDpRank,
+    virtual_decode_blocks: usize,
+    virtual_prefill_tokens: usize,
+}
+
+#[derive(Debug)]
+struct PrefetchWindowOverlay {
+    virtual_decode_blocks: HashMap<WorkerWithDpRank, usize>,
+    virtual_prefill_tokens: HashMap<WorkerWithDpRank, usize>,
+    reservations: HashMap<(WorkerWithDpRank, LocalBlockHash), OverlayReservation>,
+    requests: HashMap<String, SpeculativeRequestState>,
+    reservation_ttl: Duration,
+    reservation_capacity: usize,
+}
+
+impl PrefetchWindowOverlay {
+    fn new() -> Self {
+        Self {
+            virtual_decode_blocks: HashMap::new(),
+            virtual_prefill_tokens: HashMap::new(),
+            reservations: HashMap::new(),
+            requests: HashMap::new(),
+            reservation_ttl: Duration::from_millis(env_u64_bounded(
+                "DYN_CXL_PREFETCH_LOOKAHEAD_RESERVATION_TTL_MS",
+                5_000,
+                60_000,
+            )),
+            reservation_capacity: env_usize_bounded(
+                "DYN_CXL_PREFETCH_LOOKAHEAD_RESERVATION_CAPACITY",
+                16_384,
+                1_000_000,
+            ),
+        }
+    }
+
+    /// Start a new request window.  Actual residency/load is read again from
+    /// the request snapshots produced by KvRouter; only unresolved speculative
+    /// block reservations are carried across the boundary.
+    fn begin_window(&mut self) {
+        self.virtual_decode_blocks.clear();
+        self.virtual_prefill_tokens.clear();
+        self.requests.clear();
+        self.expire_reservations();
+    }
+
+    fn expire_reservations(&mut self) {
+        let now = Instant::now();
+        self.reservations
+            .retain(|_, reservation| reservation.expires_at > now);
+    }
+
+    /// Apply the speculative state to a temporary request copy before worker
+    /// selection.  The caller must not feed this temporary state back into the
+    /// authoritative router/indexer.
+    fn apply_to_request(&mut self, request: &mut SchedulingRequest) {
+        self.expire_reservations();
+
+        for (worker, blocks) in &self.virtual_decode_blocks {
+            let entry = request.decode_blocks.entry(*worker).or_insert(0);
+            *entry = entry.saturating_add(*blocks);
+        }
+        for (worker, tokens) in &self.virtual_prefill_tokens {
+            let entry = request.prefill_tokens.entry(*worker).or_insert(0);
+            *entry = entry.saturating_add(*tokens);
+        }
+
+        // A reserved CXL-only block is treated as prefetch-inflight for the
+        // next speculative decision.  Do not turn it into a CPU hit before
+        // LMCache reports successful promotion, and do not double-count a
+        // block that has already become GPU/CPU resident.
+        for (worker, metadata) in &mut request.overlaps.block_residency {
+            for block in metadata {
+                let key = (*worker, block.block_hash);
+                if !self.reservations.contains_key(&key)
+                    || !block.cxl
+                    || block.gpu
+                    || block.cpu
+                    || block.prefetch_inflight
+                {
+                    continue;
+                }
+                block.prefetch_inflight = true;
+                let score = request
+                    .overlaps
+                    .prefetch_inflight_scores
+                    .entry(*worker)
+                    .or_insert(0);
+                *score = score.saturating_add(1);
+            }
+        }
+    }
+
+    /// Record one admitted prefetch.  The request's virtual route load is
+    /// charged to the selected worker so later prefetches in the same window
+    /// see the same type of load pressure as the final router.
+    fn record_admission(
+        &mut self,
+        request_id: &str,
+        request: &SchedulingRequest,
+        selection: &WorkerSelectionResult,
+        candidate_blocks: &[LocalBlockHash],
+        block_size: u32,
+    ) {
+        self.expire_reservations();
+
+        let virtual_decode_blocks = selection.required_blocks as usize;
+        let virtual_prefill_tokens = request.isl_tokens.saturating_sub(
+            (selection.overlap_blocks as usize).saturating_mul(block_size as usize),
+        );
+        let decode_entry = self
+            .virtual_decode_blocks
+            .entry(selection.worker)
+            .or_insert(0);
+        *decode_entry = decode_entry.saturating_add(virtual_decode_blocks);
+        let prefill_entry = self
+            .virtual_prefill_tokens
+            .entry(selection.worker)
+            .or_insert(0);
+        *prefill_entry = prefill_entry.saturating_add(virtual_prefill_tokens);
+
+        let expires_at = Instant::now() + self.reservation_ttl;
+        for block_hash in candidate_blocks {
+            let key = (selection.worker, *block_hash);
+            if !self.reservations.contains_key(&key)
+                && self.reservations.len() >= self.reservation_capacity
+            {
+                break;
+            }
+            let entry = self
+                .reservations
+                .entry(key)
+                .or_insert(OverlayReservation { expires_at });
+            entry.expires_at = expires_at;
+        }
+
+        self.requests.insert(
+            request_id.to_string(),
+            SpeculativeRequestState {
+                worker: selection.worker,
+                virtual_decode_blocks,
+                virtual_prefill_tokens,
+            },
+        );
+    }
+
+    /// The real route has now entered ActiveSequences.  Remove only the
+    /// virtual load; keep block reservations until the physical prefetch
+    /// succeeds/fails or the TTL expires.
+    fn commit_route(&mut self, request_id: &str) {
+        let Some(state) = self.requests.remove(request_id) else {
+            return;
+        };
+        if let Some(value) = self.virtual_decode_blocks.get_mut(&state.worker) {
+            *value = value.saturating_sub(state.virtual_decode_blocks);
+            if *value == 0 {
+                self.virtual_decode_blocks.remove(&state.worker);
+            }
+        }
+        if let Some(value) = self.virtual_prefill_tokens.get_mut(&state.worker) {
+            *value = value.saturating_sub(state.virtual_prefill_tokens);
+            if *value == 0 {
+                self.virtual_prefill_tokens.remove(&state.worker);
+            }
+        }
+    }
+}
+
+/// Return exact router blocks that are CXL-only on a predicted worker.
+///
+/// The candidate limit bounds the number of promotions, while the scan limit
+/// bounds how far into the matched prefix we are willing to derive keys.  They
+/// are deliberately different: a CXL-only block may occur after local/GPU
+/// blocks or in the middle of the prefix. Aggregate CXL residency is not used
+/// because it includes blocks already available in LocalCPU/GPU.
+fn cxl_only_prefetch_metadata(
+    overlaps: &OverlapScores,
+    worker: WorkerWithDpRank,
+    max_candidates: usize,
+    max_scan_chunks: usize,
+) -> Vec<BlockResidencyMetadata> {
+    block_residency_snapshot_all(overlaps, worker)
+        .iter()
+        .filter(|metadata| (metadata.block_index as usize) < max_scan_chunks && metadata.cxl_only())
+        .take(max_candidates)
+        .cloned()
+        .collect()
+}
+
+#[cfg(test)]
+fn cxl_only_prefetch_blocks(
+    overlaps: &OverlapScores,
+    worker: WorkerWithDpRank,
+    max_candidates: usize,
+    max_scan_chunks: usize,
+) -> Vec<LocalBlockHash> {
+    cxl_only_prefetch_metadata(overlaps, worker, max_candidates, max_scan_chunks)
+        .into_iter()
+        .map(|metadata| metadata.block_hash)
+        .collect()
+}
+
+/// Return the bounded per-block snapshot used by the worker-side hint.
+///
+/// Keep this separate from the aggregate overlap counters so the timeline can
+/// explain both positive and negative lookahead decisions.  In particular, a
+/// request with `cxl_overlap_blocks=0` may still have matched blocks, but they
+/// may be GPU/CPU-resident, not CXL-visible on this worker, or already
+/// prefetching.  The snapshot is emitted only when timeline logging is enabled
+/// and is bounded by the same prefix window as the current hint path.
+fn block_residency_snapshot(
+    overlaps: &OverlapScores,
+    worker: WorkerWithDpRank,
+    max_chunks: usize,
+) -> Vec<BlockResidencyMetadata> {
+    overlaps
+        .block_residency
+        .get(&worker)
+        .into_iter()
+        .flatten()
+        .filter(|metadata| metadata.block_index < max_chunks as u32)
+        .cloned()
+        .collect()
+}
+
+/// Return all per-block metadata retained by the router for a worker.
+///
+/// The indexer already caps this vector, so logging the full snapshot remains
+/// bounded while exposing blocks that are outside the worker-side hint window.
+fn block_residency_snapshot_all(
+    overlaps: &OverlapScores,
+    worker: WorkerWithDpRank,
+) -> Vec<BlockResidencyMetadata> {
+    overlaps
+        .block_residency
+        .get(&worker)
+        .into_iter()
+        .flatten()
+        .cloned()
+        .collect()
+}
+
 impl KvScheduler {
-    pub async fn start(
+    pub(crate) async fn start(
         component: Component,
         block_size: u32,
         workers_with_configs: Arc<RuntimeConfigsWithNotify>,
         selector: Option<Box<dyn WorkerSelector + Send + Sync>>,
+        cxl_prefetch_client: Arc<CxlPrefetchClient>,
         replica_sync: bool,
         router_id: u64,
     ) -> Result<Self, KvSchedulerError> {
@@ -165,6 +469,26 @@ impl KvScheduler {
 
         let slots_clone = slots.clone();
         let workers_scheduler = workers_with_configs.clone();
+        let lookahead_window = cxl_prefetch_client.lookahead_window();
+        // The backlog window is a separate, default-off test/control knob.
+        // It lets the scheduler retain a bounded FIFO of requests even when
+        // lookahead itself is disabled, so baseline and each prefetch mode can
+        // be measured with the same actual route backlog.
+        let route_backlog_window =
+            env_usize_bounded("DYN_CXL_PREFETCH_ROUTE_BACKLOG_WINDOW", 0, 16);
+        let route_backlog_hold_ms =
+            env_u64_bounded("DYN_CXL_PREFETCH_ROUTE_BACKLOG_HOLD_MS", 0, 5_000);
+        let pending_window = lookahead_window.max(route_backlog_window);
+        let timeline_enabled = env_bool("DYN_CXL_PREFETCH_TIMELINE_ENABLED", false);
+        if pending_window > 0 || route_backlog_hold_ms > 0 || timeline_enabled {
+            tracing::info!(
+                lookahead_window,
+                route_backlog_window,
+                route_backlog_hold_ms,
+                timeline_enabled,
+                "Dynamo route backlog/prefetch instrumentation configured"
+            );
+        }
         let (request_tx, request_rx) = tokio::sync::mpsc::channel::<SchedulingRequest>(1024);
         let scheduler_cancel_token = component.drt().primary_token();
         let hit_rate_publisher =
@@ -175,6 +499,8 @@ impl KvScheduler {
         // Background task to handle scheduling requests
         tokio::spawn(async move {
             let mut request_rx = request_rx;
+            let mut pending_requests = VecDeque::new();
+            let mut prefetch_overlay = PrefetchWindowOverlay::new();
             tracing::trace!("scheduler background task started");
 
             loop {
@@ -184,12 +510,262 @@ impl KvScheduler {
                     break;
                 }
 
-                // Wait for a new request
-                let Some(mut request) = request_rx.recv().await else {
+                // An empty pending FIFO marks the beginning of a new bounded
+                // lookahead window.  Rebase virtual load on fresh request
+                // overlap snapshots while retaining only short-lived
+                // in-flight block reservations.
+                if pending_requests.is_empty() {
+                    prefetch_overlay.begin_window();
+                }
+
+                // Preserve FIFO route order, while retaining a small bounded
+                // view of requests that are still waiting behind this one.
+                let Some(mut request) = (if let Some(request) = pending_requests.pop_front() {
+                    Some(request)
+                } else {
+                    request_rx.recv().await
+                }) else {
                     tracing::warn!("scheduler shutdown");
                     break;
                 };
                 tracing::trace!("received request to be scheduled");
+
+                // A caller can cancel while its request is waiting in the
+                // channel. Do not route or prefetch a request whose response
+                // receiver has already gone away.
+                if request
+                    .resp_tx
+                    .as_ref()
+                    .map(|tx| tx.is_closed())
+                    .unwrap_or(true)
+                {
+                    continue;
+                }
+
+                if pending_window > 0 {
+                    while pending_requests.len() < pending_window {
+                        match request_rx.try_recv() {
+                            Ok(request) => pending_requests.push_back(request),
+                            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+                            | Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+                        }
+                    }
+
+                    // Use the same current worker snapshot and selector as
+                    // normal routing, but do not mutate slot reservations or
+                    // send the waiting requests' responses. This is the
+                    // actual Dynamo waiting-queue lookahead point.
+                    if !pending_requests.is_empty() {
+                        let workers: HashMap<WorkerId, Option<ModelRuntimeConfig>> =
+                            workers_scheduler
+                                .configs
+                                .iter()
+                                .map(|r| (*r.key(), r.value().clone()))
+                                .collect();
+                        let queue_depth = pending_requests.len();
+
+                        for pending in pending_requests.iter_mut() {
+                            if pending.lookahead_dispatched
+                                || !pending.update_states
+                                || pending
+                                    .resp_tx
+                                    .as_ref()
+                                    .map(|tx| tx.is_closed())
+                                    .unwrap_or(true)
+                            {
+                                continue;
+                            }
+
+                            let Some(request_id) = pending.maybe_request_id.clone() else {
+                                pending.lookahead_dispatched = true;
+                                continue;
+                            };
+                            let Some(token_ids) = pending.prefetch_token_ids.as_deref() else {
+                                pending.lookahead_dispatched = true;
+                                continue;
+                            };
+
+                            let (decode_blocks, prefill_tokens) = slots_clone
+                                .potential_blocks_and_tokens(
+                                    pending.token_seq.clone(),
+                                    pending.isl_tokens,
+                                    pending.overlaps.clone(),
+                                )
+                                .await;
+
+                            // Use a sender-free temporary request so
+                            // speculative overlay state cannot leak into the
+                            // authoritative route/cache-hit bookkeeping.
+                            let mut planning = pending.planning_clone();
+                            planning.decode_blocks = decode_blocks;
+                            planning.prefill_tokens = prefill_tokens;
+                            prefetch_overlay.apply_to_request(&mut planning);
+
+                            let selection = match selector
+                                .select_worker(&workers, &planning, block_size)
+                            {
+                                Ok(selection) => selection,
+                                Err(error) => {
+                                    tracing::debug!(
+                                        request_id = %request_id,
+                                        ?error,
+                                        "Dynamo waiting-route CXL lookahead could not predict a worker"
+                                    );
+                                    pending.lookahead_dispatched = true;
+                                    continue;
+                                }
+                            };
+
+                            // Aggregate CXL residency is not enough here:
+                            // `cxl_resident_scores` also includes blocks that
+                            // are already in this worker's LocalCPU/GPU.
+                            // Retain exact CXL-only blocks anywhere inside the
+                            // bounded scan window. The worker receives their
+                            // indices and derives only those sparse keys, so a
+                            // local/GPU block between two CXL blocks is not
+                            // redundantly promoted.
+                            let residency_all =
+                                block_residency_snapshot_all(&planning.overlaps, selection.worker);
+                            let residency_snapshot = block_residency_snapshot(
+                                &planning.overlaps,
+                                selection.worker,
+                                cxl_prefetch_client.max_scan_chunks(),
+                            );
+                            let residency_total_blocks = residency_all.len();
+                            let candidate_metadata = cxl_only_prefetch_metadata(
+                                &planning.overlaps,
+                                selection.worker,
+                                cxl_prefetch_client.max_chunks(),
+                                cxl_prefetch_client.max_scan_chunks(),
+                            );
+                            let candidate_blocks: Vec<LocalBlockHash> = candidate_metadata
+                                .iter()
+                                .map(|metadata| metadata.block_hash)
+                                .collect();
+                            let candidate_block_indices: Vec<u32> = candidate_metadata
+                                .iter()
+                                .map(|metadata| metadata.block_index)
+                                .collect();
+                            let cxl_overlap_blocks = candidate_blocks.len();
+
+                            // Stage 1 of the funnel: this request is still in
+                            // Dynamo's bounded waiting queue and has a valid
+                            // worker prediction.  Keep this event independent
+                            // of the lookahead enable bit so baseline retains
+                            // the same waiting-candidate denominator.
+                            if timeline_enabled {
+                                tracing::info!(
+                                    request_id = %request_id,
+                                    predicted_worker_id = selection.worker.worker_id,
+                                    predicted_dp_rank = selection.worker.dp_rank,
+                                    cxl_overlap_blocks,
+                                    cxl_candidate_indices = ?candidate_block_indices,
+                                    cxl_candidate_hashes = ?candidate_blocks,
+                                    residency_total_blocks,
+                                    residency_window_blocks = residency_snapshot.len(),
+                                    residency_beyond_window_blocks = residency_total_blocks
+                                        .saturating_sub(residency_snapshot.len()),
+                                    residency_gpu_blocks = residency_snapshot
+                                        .iter()
+                                        .filter(|metadata| metadata.gpu)
+                                        .count(),
+                                    residency_cpu_blocks = residency_snapshot
+                                        .iter()
+                                        .filter(|metadata| metadata.cpu)
+                                        .count(),
+                                    residency_cxl_blocks = residency_snapshot
+                                        .iter()
+                                        .filter(|metadata| metadata.cxl)
+                                        .count(),
+                                    residency_prefetch_inflight_blocks = residency_snapshot
+                                        .iter()
+                                        .filter(|metadata| metadata.prefetch_inflight)
+                                        .count(),
+                                    block_residency_window = ?residency_snapshot,
+                                    block_residency = ?residency_all,
+                                    candidate_token_count = token_ids.len(),
+                                    lookahead_enabled = cxl_prefetch_client.lookahead_enabled(),
+                                    queue_depth,
+                                    route_enqueued_unix_ns = pending.enqueued_unix_ns,
+                                    candidate_unix_ns = unix_time_ns(),
+                                    "Dynamo waiting-route CXL prefetch lookahead candidate"
+                                );
+                            }
+                            let Some(prefetch_tokens) = cxl_prefetch_client
+                                .prepare_tokens(token_ids, &candidate_block_indices)
+                            else {
+                                pending.lookahead_dispatched = true;
+                                continue;
+                            };
+
+                            // A CXL miss cannot be helped by this hint. The
+                            // normal route-time path remains responsible for
+                            // any other tier or future residency change.
+                            if cxl_overlap_blocks == 0 {
+                                pending.lookahead_dispatched = true;
+                                continue;
+                            }
+
+                            let admitted_at = Instant::now();
+                            let admitted_unix_ns = unix_time_ns();
+                            let admitted = cxl_prefetch_client.dispatch_lookahead(
+                                request_id.clone(),
+                                prefetch_tokens,
+                                selection.worker,
+                                candidate_blocks.clone(),
+                                candidate_block_indices,
+                                PrefetchTrace {
+                                    route_enqueued_unix_ns: Some(pending.enqueued_unix_ns),
+                                    lookahead_admitted_unix_ns: Some(admitted_unix_ns),
+                                    queue_depth: Some(queue_depth),
+                                },
+                            );
+                            pending.lookahead_dispatched = true;
+                            if admitted {
+                                prefetch_overlay.record_admission(
+                                    &request_id,
+                                    &planning,
+                                    &selection,
+                                    &candidate_blocks,
+                                    block_size,
+                                );
+                                pending.lookahead_admitted_at = Some(admitted_at);
+                                pending.lookahead_admitted_unix_ns = Some(admitted_unix_ns);
+                                pending.lookahead_predicted_worker = Some(selection.worker);
+                                tracing::info!(
+                                    request_id = %request_id,
+                                    predicted_worker_id = selection.worker.worker_id,
+                                    predicted_dp_rank = selection.worker.dp_rank,
+                                    cxl_overlap_blocks,
+                                    queue_depth,
+                                    route_enqueued_unix_ns = pending.enqueued_unix_ns,
+                                    lookahead_admitted_unix_ns = admitted_unix_ns,
+                                    route_queue_age_ms = pending.enqueued_at.elapsed().as_secs_f64()
+                                        * 1_000.0,
+                                    overlay_virtual_decode_blocks = prefetch_overlay
+                                        .virtual_decode_blocks
+                                        .get(&selection.worker)
+                                        .copied()
+                                        .unwrap_or(0),
+                                    overlay_virtual_prefill_tokens = prefetch_overlay
+                                        .virtual_prefill_tokens
+                                        .get(&selection.worker)
+                                        .copied()
+                                        .unwrap_or(0),
+                                    "Dynamo waiting-route CXL prefetch lookahead admitted"
+                                );
+                            }
+                        }
+                    }
+                }
+
+                // In benchmark mode this is the bounded route-service delay:
+                // pending requests remain in Dynamo while their hints travel
+                // to the worker. It is default-off and applies equally to
+                // baseline/lookahead modes for a fair comparison.
+                if route_backlog_hold_ms > 0 && !pending_requests.is_empty() {
+                    tokio::time::sleep(Duration::from_millis(route_backlog_hold_ms)).await;
+                }
 
                 let (decode_blocks, prefill_tokens) = slots_clone
                     .potential_blocks_and_tokens(
@@ -208,8 +784,67 @@ impl KvScheduler {
                     .map(|r| (*r.key(), r.value().clone()))
                     .collect();
 
-                match selector.select_worker(&workers, &request, block_size) {
+                // An admitted waiting-route prefetch carries a bounded route
+                // reservation.  Reuse that worker when the endpoint is still
+                // available; otherwise fall back to a fresh authoritative
+                // selection rather than routing to a dead worker.
+                let mut reused_predicted_route = false;
+                let selection_result =
+                    if let Some(predicted_worker) = request.lookahead_predicted_worker {
+                        if worker_is_available(&workers, predicted_worker) {
+                            reused_predicted_route = true;
+                            tracing::info!(
+                                predicted_worker_id = predicted_worker.worker_id,
+                                predicted_dp_rank = predicted_worker.dp_rank,
+                                "Reusing waiting-route prefetch worker for final route"
+                            );
+                            Ok(WorkerSelectionResult {
+                                worker: predicted_worker,
+                                required_blocks: request.isl_tokens.div_ceil(block_size as usize)
+                                    as u64,
+                                overlap_blocks: request
+                                    .overlaps
+                                    .scores
+                                    .get(&predicted_worker)
+                                    .copied()
+                                    .unwrap_or(0),
+                            })
+                        } else {
+                            tracing::warn!(
+                                predicted_worker_id = predicted_worker.worker_id,
+                                predicted_dp_rank = predicted_worker.dp_rank,
+                                "Prefetch worker unavailable; recomputing final route"
+                            );
+                            selector.select_worker(&workers, &request, block_size)
+                        }
+                    } else {
+                        selector.select_worker(&workers, &request, block_size)
+                    };
+
+                match selection_result {
                     Ok(selection) => {
+                        if timeline_enabled {
+                            tracing::info!(
+                                request_id = request.maybe_request_id.as_deref().unwrap_or(""),
+                                route_enqueued_unix_ns = request.enqueued_unix_ns,
+                                route_queue_wait_ms =
+                                    request.enqueued_at.elapsed().as_secs_f64() * 1_000.0,
+                                lookahead_admitted_unix_ns = request.lookahead_admitted_unix_ns,
+                                lookahead_wait_ms = request
+                                    .lookahead_admitted_at
+                                    .map(|at| at.elapsed().as_secs_f64() * 1_000.0),
+                                predicted_worker_id = request
+                                    .lookahead_predicted_worker
+                                    .map(|worker| worker.worker_id),
+                                predicted_dp_rank = request
+                                    .lookahead_predicted_worker
+                                    .map(|worker| worker.dp_rank),
+                                selected_worker_id = selection.worker.worker_id,
+                                selected_dp_rank = selection.worker.dp_rank,
+                                route_target_reused = reused_predicted_route,
+                                "Dynamo route request timeline"
+                            );
+                        }
                         let event = KVHitRateEvent {
                             worker_id: selection.worker.worker_id,
                             dp_rank: selection.worker.dp_rank,
@@ -223,25 +858,27 @@ impl KvScheduler {
                         let response = SchedulingResponse {
                             best_worker: selection.worker,
                             overlap_blocks: selection.overlap_blocks,
+                            decode_blocks: request.decode_blocks.clone(),
+                            prefill_tokens: request.prefill_tokens.clone(),
                         };
-                        request.respond(response);
-
                         // Skip state update if not requested
                         if !request.update_states {
+                            request.respond(response);
                             continue;
                         }
 
-                        let Some(request_id) = request.maybe_request_id else {
+                        let Some(ref request_id) = request.maybe_request_id else {
                             tracing::error!(
                                 "No request_id provided to add_request to the slot tracker"
                             );
+                            request.respond(response);
                             continue;
                         };
 
                         if let Err(e) = slots_clone
                             .add_request(
                                 request_id.clone(),
-                                request.token_seq,
+                                request.token_seq.clone(),
                                 request.isl_tokens,
                                 selection.overlap_blocks,
                                 None, // expected_output_tokens not available in scheduler loop
@@ -251,6 +888,10 @@ impl KvScheduler {
                         {
                             tracing::warn!("Failed to add request {request_id}: {e}");
                         }
+                        prefetch_overlay.commit_route(request_id);
+                        // A route-time hint is sent only after the reservation
+                        // is visible in the active-sequence tracker.
+                        request.respond(response);
                     }
                     Err(KvSchedulerError::NoEndpoints) => {
                         tracing::trace!("no endpoints available; waiting for endpoints update");
@@ -285,6 +926,51 @@ impl KvScheduler {
         router_config_override: Option<&RouterConfigOverride>,
         update_states: bool,
     ) -> Result<WorkerWithDpRank, KvSchedulerError> {
+        Ok(self
+            .schedule_with_details_and_tokens(
+                maybe_request_id,
+                isl_tokens,
+                token_seq,
+                overlaps,
+                router_config_override,
+                update_states,
+                None,
+            )
+            .await?
+            .best_worker)
+    }
+
+    pub async fn schedule_with_details(
+        &self,
+        maybe_request_id: Option<String>,
+        isl_tokens: usize,
+        token_seq: Option<Vec<SequenceHash>>,
+        overlaps: OverlapScores,
+        router_config_override: Option<&RouterConfigOverride>,
+        update_states: bool,
+    ) -> Result<SchedulingResponse, KvSchedulerError> {
+        self.schedule_with_details_and_tokens(
+            maybe_request_id,
+            isl_tokens,
+            token_seq,
+            overlaps,
+            router_config_override,
+            update_states,
+            None,
+        )
+        .await
+    }
+
+    pub async fn schedule_with_details_and_tokens(
+        &self,
+        maybe_request_id: Option<String>,
+        isl_tokens: usize,
+        token_seq: Option<Vec<SequenceHash>>,
+        overlaps: OverlapScores,
+        router_config_override: Option<&RouterConfigOverride>,
+        update_states: bool,
+        prefetch_token_ids: Option<Vec<u32>>,
+    ) -> Result<SchedulingResponse, KvSchedulerError> {
         let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
         let request = SchedulingRequest {
             maybe_request_id,
@@ -295,6 +981,13 @@ impl KvScheduler {
             prefill_tokens: HashMap::new(),
             router_config_override: router_config_override.cloned(),
             update_states,
+            prefetch_token_ids,
+            lookahead_dispatched: false,
+            enqueued_at: Instant::now(),
+            enqueued_unix_ns: unix_time_ns(),
+            lookahead_admitted_at: None,
+            lookahead_admitted_unix_ns: None,
+            lookahead_predicted_worker: None,
             resp_tx: Some(resp_tx), // Wrap in Some()
         };
 
@@ -306,7 +999,7 @@ impl KvScheduler {
             .await
             .map_err(|_| KvSchedulerError::SubscriberShutdown)?;
 
-        Ok(response.best_worker)
+        Ok(response)
     }
 
     pub async fn add_request(
@@ -471,6 +1164,164 @@ impl DefaultWorkerSelector {
     }
 }
 
+fn shared_cpu_overlap_weight(
+    cpu_weight: f64,
+    cxl_weight: f64,
+    worker_load: usize,
+    min_load: usize,
+    max_load: usize,
+    enabled: bool,
+) -> f64 {
+    if !enabled || max_load <= min_load {
+        return cpu_weight;
+    }
+    let pressure = (worker_load.saturating_sub(min_load) as f64) / ((max_load - min_load) as f64);
+    cpu_weight + (cxl_weight - cpu_weight) * pressure.clamp(0.0, 1.0)
+}
+
+fn background_offload_enabled(config: &KvRouterConfig) -> bool {
+    env::var("DYN_BACKGROUND_OFFLOAD_ENABLED")
+        .ok()
+        .and_then(|value| value.parse::<bool>().ok())
+        .unwrap_or(config.enable_background_offload)
+}
+
+/// Prefer an already-CXL-visible alternate only when the CPU owner is
+/// materially busy.  This is intentionally a narrow branch before the normal
+/// strata score calculation; all fixed tier weights remain unchanged.
+fn select_shared_cxl_override(
+    workers: &HashMap<WorkerId, Option<ModelRuntimeConfig>>,
+    request: &SchedulingRequest,
+    block_size: u32,
+    config: &KvRouterConfig,
+) -> Option<WorkerSelectionResult> {
+    if !background_offload_enabled(config) || !request.update_states || block_size == 0 {
+        return None;
+    }
+    let owner = request
+        .overlaps
+        .cpu_scores
+        .iter()
+        .max_by_key(|(_, score)| *score)
+        .filter(|(_, score)| **score > 0)
+        .map(|(worker, _)| *worker)?;
+    let owner_load = worker_load(request, owner, block_size);
+    let owner_threshold = env::var("DYN_BACKGROUND_OFFLOAD_OWNER_LOAD_THRESHOLD")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(config.offload_owner_load_threshold as usize);
+    let load_margin = env::var("DYN_BACKGROUND_OFFLOAD_LOAD_MARGIN")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(1);
+    if owner_load < owner_threshold {
+        return None;
+    }
+
+    let alternate = workers
+        .iter()
+        .flat_map(|(worker_id, config)| {
+            let dp_size = config
+                .as_ref()
+                .map(|cfg| cfg.data_parallel_size)
+                .unwrap_or(1);
+            (0..dp_size).map(move |dp_rank| WorkerWithDpRank::new(*worker_id, dp_rank))
+        })
+        .filter(|worker| *worker != owner)
+        .filter(|worker| {
+            request
+                .overlaps
+                .cxl_scores
+                .get(worker)
+                .copied()
+                .unwrap_or(0)
+                > 0
+        })
+        .filter_map(|worker| {
+            let load = worker_load(request, worker, block_size);
+            (load.saturating_add(load_margin) < owner_load).then_some((worker, load))
+        })
+        .min_by_key(|(worker, load)| {
+            (
+                *load,
+                request
+                    .overlaps
+                    .tree_sizes
+                    .get(worker)
+                    .copied()
+                    .unwrap_or(0),
+            )
+        })
+        .map(|(worker, _)| worker)?;
+
+    Some(WorkerSelectionResult {
+        worker: alternate,
+        required_blocks: request.isl_tokens.div_ceil(block_size as usize) as u64,
+        overlap_blocks: request
+            .overlaps
+            .scores
+            .get(&alternate)
+            .copied()
+            .unwrap_or(0),
+    })
+}
+
+fn worker_load(request: &SchedulingRequest, worker: WorkerWithDpRank, block_size: u32) -> usize {
+    request.decode_blocks.get(&worker).copied().unwrap_or(0)
+        + request
+            .prefill_tokens
+            .get(&worker)
+            .copied()
+            .unwrap_or(0)
+            .div_ceil(block_size as usize)
+}
+
+fn worker_is_available(
+    workers: &HashMap<WorkerId, Option<ModelRuntimeConfig>>,
+    worker: WorkerWithDpRank,
+) -> bool {
+    workers
+        .get(&worker.worker_id)
+        .map(|config| {
+            let data_parallel_size = config
+                .as_ref()
+                .map(|runtime| runtime.data_parallel_size)
+                .unwrap_or(1);
+            worker.dp_rank < data_parallel_size
+        })
+        .unwrap_or(false)
+}
+
+fn env_bool(name: &str, default: bool) -> bool {
+    env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<bool>().ok())
+        .unwrap_or(default)
+}
+
+fn env_usize_bounded(name: &str, default: usize, max: usize) -> usize {
+    env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(default)
+        .min(max)
+}
+
+fn env_u64_bounded(name: &str, default: u64, max: u64) -> u64 {
+    env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(default)
+        .min(max)
+}
+
+fn unix_time_ns() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+}
+
 impl WorkerSelector for DefaultWorkerSelector {
     fn select_worker(
         &self,
@@ -484,12 +1335,42 @@ impl WorkerSelector for DefaultWorkerSelector {
             return Err(KvSchedulerError::NoEndpoints);
         }
 
+        if let Some(shared_cxl) =
+            select_shared_cxl_override(workers, request, block_size, &self.kv_router_config)
+        {
+            tracing::debug!(
+                owner_overload = true,
+                worker_id = shared_cxl.worker.worker_id,
+                dp_rank = shared_cxl.worker.dp_rank,
+                "Routing busy CPU owner to a lower-load CXL-visible worker"
+            );
+            return Ok(shared_cxl);
+        }
+
         let isl = request.isl_tokens;
         let request_blocks = isl.div_ceil(block_size as usize);
         let overlaps = &request.overlaps.scores;
 
         let decode_blocks = &request.decode_blocks;
         let prefill_tokens = &request.prefill_tokens;
+
+        let candidate_loads: Vec<usize> = workers
+            .iter()
+            .flat_map(|(worker_id, config)| {
+                let data_parallel_size = config.as_ref().map(|c| c.data_parallel_size).unwrap_or(1);
+                (0..data_parallel_size).map(move |dp_rank| {
+                    let worker = WorkerWithDpRank::new(*worker_id, dp_rank);
+                    decode_blocks.get(&worker).copied().unwrap_or(0)
+                        + prefill_tokens
+                            .get(&worker)
+                            .copied()
+                            .unwrap_or(0)
+                            .div_ceil(block_size as usize)
+                })
+            })
+            .collect();
+        let min_candidate_load = candidate_loads.iter().copied().min().unwrap_or(0);
+        let max_candidate_load = candidate_loads.iter().copied().max().unwrap_or(0);
 
         let mut worker_logits = HashMap::new();
 
@@ -530,12 +1411,41 @@ impl WorkerSelector for DefaultWorkerSelector {
                         .get(&worker)
                         .copied()
                         .unwrap_or(0) as f64;
+                    let cpu_and_cxl_blocks = request
+                        .overlaps
+                        .cpu_and_cxl_scores
+                        .get(&worker)
+                        .copied()
+                        .unwrap_or(0) as f64;
+                    let prefetch_inflight_blocks = request
+                        .overlaps
+                        .prefetch_inflight_scores
+                        .get(&worker)
+                        .copied()
+                        .unwrap_or(0) as f64;
+                    let worker_load = decode_blocks.get(&worker).copied().unwrap_or(0)
+                        + prefill_tokens
+                            .get(&worker)
+                            .copied()
+                            .unwrap_or(0)
+                            .div_ceil(block_size as usize);
+                    let shared_cpu_weight = shared_cpu_overlap_weight(
+                        self.kv_router_config.strata_cpu_overlap_weight,
+                        self.kv_router_config.strata_cxl_overlap_weight,
+                        worker_load,
+                        min_candidate_load,
+                        max_candidate_load,
+                        self.kv_router_config.strata_load_aware_shared_cpu,
+                    );
                     let effective_overlap = gpu_blocks
                         + self.kv_router_config.strata_cpu_overlap_weight * cpu_blocks
-                        + self.kv_router_config.strata_cxl_overlap_weight * cxl_blocks;
+                        + self.kv_router_config.strata_cxl_overlap_weight * cxl_blocks
+                        + shared_cpu_weight * cpu_and_cxl_blocks;
+                    let effective_overlap = effective_overlap
+                        + self.kv_router_config.strata_prefetch_overlap_weight
+                            * prefetch_inflight_blocks;
                     let effective_cached_tokens = effective_overlap * (block_size as f64);
-                    let effective_prefill_token =
-                        ((isl as f64) - effective_cached_tokens).max(0.0);
+                    let effective_prefill_token = ((isl as f64) - effective_cached_tokens).max(0.0);
                     effective_prefill_token / (block_size as f64)
                 } else {
                     let prefill_token = *prefill_tokens.get(&worker).unwrap_or(&isl);
@@ -614,7 +1524,13 @@ impl WorkerSelector for DefaultWorkerSelector {
         //             other => other,
         //         }
         //     })
-        let best_worker = if candidates.len() > 1 {
+        let best_worker = if candidates.len() > 1
+            && self.kv_router_config.use_strata_routing
+            && self.kv_router_config.strata_randomize_ties
+        {
+            let mut rng = rand::rng();
+            candidates[rng.random_range(0..candidates.len())]
+        } else if candidates.len() > 1 {
             if self.kv_router_config.use_strata_routing {
                 // tracing::info!("Multiple workers tied with same logit, using tree size as tie-breaker (kv-strata mode)");
             } else {
@@ -638,8 +1554,24 @@ impl WorkerSelector for DefaultWorkerSelector {
         let best_logit = worker_logits[&best_worker];
 
         let best_overlap = *overlaps.get(&best_worker).unwrap_or(&0);
-        let best_gpu_score = request.overlaps.gpu_scores.get(&best_worker).copied().unwrap_or(0);
-        let best_cpu_score = request.overlaps.cpu_scores.get(&best_worker).copied().unwrap_or(0);
+        let best_gpu_score = request
+            .overlaps
+            .gpu_scores
+            .get(&best_worker)
+            .copied()
+            .unwrap_or(0);
+        let best_cpu_score = request
+            .overlaps
+            .cpu_scores
+            .get(&best_worker)
+            .copied()
+            .unwrap_or(0);
+        let best_cpu_and_cxl_score = request
+            .overlaps
+            .cpu_and_cxl_scores
+            .get(&best_worker)
+            .copied()
+            .unwrap_or(0);
         let best_cxl_score = request
             .overlaps
             .cxl_scores
@@ -665,7 +1597,7 @@ impl WorkerSelector for DefaultWorkerSelector {
 
         let log_msg = if self.kv_router_config.use_strata_routing {
             format!(
-                "Routing decision: worker_id={} dp_rank={:?}, logit={:.3}, request_total_blocks={}, total_cached_blocks={}, gpu_matches={}, cpu_matches={}, cxl_matches={}, tree_size={}{}",
+                "Routing decision: worker_id={} dp_rank={:?}, logit={:.3}, request_total_blocks={}, total_cached_blocks={}, gpu_matches={}, cpu_matches={}, cpu_cxl_matches={}, cxl_matches={}, tree_size={}{}",
                 best_worker.worker_id,
                 best_worker.dp_rank,
                 best_logit,
@@ -673,6 +1605,7 @@ impl WorkerSelector for DefaultWorkerSelector {
                 best_overlap,
                 best_gpu_score,
                 best_cpu_score,
+                best_cpu_and_cxl_score,
                 best_cxl_score,
                 tree_size,
                 total_blocks_info
@@ -702,6 +1635,259 @@ impl WorkerSelector for DefaultWorkerSelector {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kv_router::indexer::BlockResidencyMetadata;
+
+    #[test]
+    fn test_shared_cpu_weight_relaxes_affinity_with_load() {
+        assert_eq!(shared_cpu_overlap_weight(0.9, 0.8, 0, 0, 100, true), 0.9);
+        assert_eq!(shared_cpu_overlap_weight(0.9, 0.8, 100, 0, 100, true), 0.8);
+        assert_eq!(shared_cpu_overlap_weight(0.9, 0.8, 100, 0, 100, false), 0.9);
+        assert_eq!(shared_cpu_overlap_weight(0.9, 0.8, 10, 10, 10, true), 0.9);
+    }
+
+    #[test]
+    fn cxl_only_prefetch_candidates_exclude_local_residency() {
+        let worker = WorkerWithDpRank::from_worker_id(3);
+        let mut overlaps = OverlapScores::new();
+        overlaps.block_residency.insert(
+            worker,
+            vec![
+                BlockResidencyMetadata {
+                    block_index: 0,
+                    block_hash: LocalBlockHash(10),
+                    gpu: false,
+                    cpu: true,
+                    cxl: true,
+                    prefetch_inflight: false,
+                },
+                BlockResidencyMetadata {
+                    block_index: 1,
+                    block_hash: LocalBlockHash(11),
+                    gpu: false,
+                    cpu: false,
+                    cxl: true,
+                    prefetch_inflight: false,
+                },
+                BlockResidencyMetadata {
+                    block_index: 2,
+                    block_hash: LocalBlockHash(12),
+                    gpu: true,
+                    cpu: false,
+                    cxl: true,
+                    prefetch_inflight: false,
+                },
+            ],
+        );
+
+        assert_eq!(
+            cxl_only_prefetch_blocks(&overlaps, worker, 3, 3),
+            vec![LocalBlockHash(11)]
+        );
+    }
+
+    #[test]
+    fn cxl_only_prefetch_candidates_keep_sparse_middle_and_suffix_blocks() {
+        let worker = WorkerWithDpRank::from_worker_id(4);
+        let mut overlaps = OverlapScores::new();
+        overlaps.block_residency.insert(
+            worker,
+            vec![
+                BlockResidencyMetadata {
+                    block_index: 0,
+                    block_hash: LocalBlockHash(20),
+                    gpu: true,
+                    cpu: false,
+                    cxl: false,
+                    prefetch_inflight: false,
+                },
+                BlockResidencyMetadata {
+                    block_index: 1,
+                    block_hash: LocalBlockHash(21),
+                    gpu: false,
+                    cpu: false,
+                    cxl: true,
+                    prefetch_inflight: false,
+                },
+                BlockResidencyMetadata {
+                    block_index: 2,
+                    block_hash: LocalBlockHash(22),
+                    gpu: true,
+                    cpu: false,
+                    cxl: false,
+                    prefetch_inflight: false,
+                },
+                BlockResidencyMetadata {
+                    block_index: 3,
+                    block_hash: LocalBlockHash(23),
+                    gpu: false,
+                    cpu: false,
+                    cxl: true,
+                    prefetch_inflight: false,
+                },
+            ],
+        );
+
+        assert_eq!(
+            cxl_only_prefetch_blocks(&overlaps, worker, 2, 4),
+            vec![LocalBlockHash(21), LocalBlockHash(23)]
+        );
+        // The candidate budget and scan window are independent. A later CXL
+        // block remains eligible even when the earlier candidate is absent.
+        let mut suffix_only = overlaps.clone();
+        suffix_only
+            .block_residency
+            .get_mut(&worker)
+            .unwrap()
+            .retain(|metadata| metadata.block_index == 3);
+        assert_eq!(
+            cxl_only_prefetch_blocks(&suffix_only, worker, 1, 4),
+            vec![LocalBlockHash(23)]
+        );
+        assert_eq!(cxl_only_prefetch_blocks(&overlaps, worker, 2, 3).len(), 1);
+    }
+
+    #[test]
+    fn prefetch_overlay_updates_future_planning_without_mutating_authority() {
+        let worker = WorkerWithDpRank::from_worker_id(5);
+        let block = LocalBlockHash(51);
+        let mut overlaps = OverlapScores::new();
+        overlaps.cxl_scores.insert(worker, 1);
+        overlaps.scores.insert(worker, 1);
+        overlaps.tree_sizes.insert(worker, 1);
+        overlaps.block_residency.insert(
+            worker,
+            vec![BlockResidencyMetadata {
+                block_index: 0,
+                block_hash: block,
+                gpu: false,
+                cpu: false,
+                cxl: true,
+                prefetch_inflight: false,
+            }],
+        );
+        let request = SchedulingRequest {
+            maybe_request_id: Some("overlay-test".to_string()),
+            token_seq: None,
+            isl_tokens: 512,
+            overlaps,
+            decode_blocks: HashMap::from([(worker, 3)]),
+            prefill_tokens: HashMap::from([(worker, 256)]),
+            router_config_override: None,
+            update_states: true,
+            prefetch_token_ids: Some(vec![1; 512]),
+            lookahead_dispatched: false,
+            enqueued_at: Instant::now(),
+            enqueued_unix_ns: unix_time_ns(),
+            lookahead_admitted_at: None,
+            lookahead_admitted_unix_ns: None,
+            lookahead_predicted_worker: None,
+            resp_tx: None,
+        };
+        let selection = WorkerSelectionResult {
+            worker,
+            required_blocks: 2,
+            overlap_blocks: 0,
+        };
+        let mut overlay = PrefetchWindowOverlay::new();
+        overlay.record_admission("overlay-test", &request, &selection, &[block], 256);
+
+        let mut planning = request.planning_clone();
+        overlay.apply_to_request(&mut planning);
+
+        assert_eq!(request.decode_blocks.get(&worker), Some(&3));
+        assert_eq!(planning.decode_blocks.get(&worker), Some(&5));
+        assert_eq!(planning.prefill_tokens.get(&worker), Some(&768));
+        assert_eq!(
+            planning.overlaps.prefetch_inflight_scores.get(&worker),
+            Some(&1)
+        );
+        assert!(planning.overlaps.block_residency[&worker][0].prefetch_inflight);
+        assert!(!request.overlaps.block_residency[&worker][0].prefetch_inflight);
+
+        overlay.commit_route("overlay-test");
+        assert!(overlay.virtual_decode_blocks.is_empty());
+        assert!(overlay.virtual_prefill_tokens.is_empty());
+        assert!(overlay.reservations.contains_key(&(worker, block)));
+    }
+
+    #[test]
+    fn prefetch_overlay_rebases_load_but_retains_unresolved_reservations() {
+        let worker = WorkerWithDpRank::from_worker_id(6);
+        let block = LocalBlockHash(61);
+        let request = SchedulingRequest {
+            maybe_request_id: Some("rebase-test".to_string()),
+            token_seq: None,
+            isl_tokens: 256,
+            overlaps: OverlapScores::new(),
+            decode_blocks: HashMap::new(),
+            prefill_tokens: HashMap::new(),
+            router_config_override: None,
+            update_states: true,
+            prefetch_token_ids: Some(vec![1; 256]),
+            lookahead_dispatched: false,
+            enqueued_at: Instant::now(),
+            enqueued_unix_ns: unix_time_ns(),
+            lookahead_admitted_at: None,
+            lookahead_admitted_unix_ns: None,
+            lookahead_predicted_worker: None,
+            resp_tx: None,
+        };
+        let selection = WorkerSelectionResult {
+            worker,
+            required_blocks: 1,
+            overlap_blocks: 0,
+        };
+        let mut overlay = PrefetchWindowOverlay::new();
+        overlay.record_admission("rebase-test", &request, &selection, &[block], 256);
+        overlay.commit_route("rebase-test");
+        overlay.begin_window();
+
+        assert!(overlay.virtual_decode_blocks.is_empty());
+        assert!(overlay.virtual_prefill_tokens.is_empty());
+        assert!(overlay.reservations.contains_key(&(worker, block)));
+    }
+
+    #[test]
+    fn test_background_override_chooses_lower_load_cxl_worker() {
+        let owner = WorkerWithDpRank::from_worker_id(1);
+        let alternate = WorkerWithDpRank::from_worker_id(2);
+        let workers = HashMap::from([(owner.worker_id, None), (alternate.worker_id, None)]);
+        let mut overlaps = OverlapScores::new();
+        overlaps.cpu_scores.insert(owner, 4);
+        overlaps.cxl_scores.insert(alternate, 4);
+        overlaps.scores.insert(owner, 4);
+        overlaps.scores.insert(alternate, 4);
+        overlaps.tree_sizes.insert(alternate, 1);
+        let request = SchedulingRequest {
+            maybe_request_id: Some("offload-test".to_string()),
+            token_seq: None,
+            isl_tokens: 8,
+            overlaps,
+            decode_blocks: HashMap::from([(owner, 5), (alternate, 1)]),
+            prefill_tokens: HashMap::new(),
+            router_config_override: None,
+            update_states: true,
+            prefetch_token_ids: None,
+            lookahead_dispatched: false,
+            enqueued_at: Instant::now(),
+            enqueued_unix_ns: unix_time_ns(),
+            lookahead_admitted_at: None,
+            lookahead_admitted_unix_ns: None,
+            lookahead_predicted_worker: None,
+            resp_tx: None,
+        };
+        let mut config = KvRouterConfig::default();
+        config.enable_background_offload = true;
+        config.offload_owner_load_threshold = 3;
+
+        let selected = select_shared_cxl_override(&workers, &request, 4, &config)
+            .expect("busy owner with a CXL-visible alternate should be overridden");
+        assert_eq!(selected.worker, alternate);
+        assert_eq!(selected.required_blocks, 2);
+
+        config.enable_background_offload = false;
+        assert!(select_shared_cxl_override(&workers, &request, 4, &config).is_none());
+    }
 
     #[test]
     fn test_softmax_sample_single_key() {

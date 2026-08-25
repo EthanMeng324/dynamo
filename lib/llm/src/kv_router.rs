@@ -1,8 +1,12 @@
 // SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::env;
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicU64, Ordering},
+};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -24,17 +28,28 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 pub mod approx;
+pub mod global_prefetch;
 pub mod indexer;
+pub mod offload;
+pub mod prefetch;
+pub mod prefetch_hint;
 pub mod prefill_router;
 pub mod protocols;
 pub mod publisher;
 pub mod recorder;
 pub mod scheduler;
+pub mod segment_id;
 pub mod sequence;
 pub mod subscriber;
 pub mod worker_query;
 
+use global_prefetch::{
+    GlobalPrefetchDispatch, GlobalPrefetchManager, PrefetchReservation, WorkerPrefetchCandidate,
+};
 use indexer::WorkerKvQueryResponse;
+use offload::BackgroundOffloadPlanner;
+use prefetch::CxlPrefetchClient;
+use prefetch_hint::PrefetchHintDispatcher;
 pub use prefill_router::PrefillRouter;
 use worker_query::WorkerQueryClient;
 
@@ -126,6 +141,7 @@ pub struct RouterConfigOverride {
 
 /// KV Router configuration parameters
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(default)]
 pub struct KvRouterConfig {
     pub overlap_score_weight: f64,
 
@@ -175,6 +191,30 @@ pub struct KvRouterConfig {
     /// Weight (<= 1.0) applied to CXL cache hits relative to GPU hits in kv-strata mode.
     /// Typically lower than the CPU weight to reflect the higher transfer cost. Unused in kv mode.
     pub strata_cxl_overlap_weight: f64,
+
+    /// Weight for a block whose CXL-to-CPU copy is currently inflight.
+    pub strata_prefetch_overlap_weight: f64,
+
+    /// When enabled, blocks present in both local CPU and shared CXL lose the
+    /// CPU-only weight advantage as the owning worker's decode and prefill load rises.
+    pub strata_load_aware_shared_cpu: bool,
+
+    /// Randomize exact-score ties in kv-strata mode to avoid deterministic
+    /// herding after a prefix becomes available through shared CXL.
+    pub strata_randomize_ties: bool,
+
+    /// Enable the bounded periodic CPU-to-CXL admission planner.
+    pub enable_background_offload: bool,
+    /// Log candidates without sending controller commands when true.
+    pub background_offload_dry_run: bool,
+    pub offload_interval_ms: u64,
+    pub offload_window_ms: u64,
+    pub offload_hot_request_threshold: u32,
+    pub offload_owner_load_threshold: u64,
+    pub offload_top_k: usize,
+    pub offload_max_chunks: usize,
+    pub offload_max_inflight: usize,
+    pub offload_cooldown_secs: u64,
 }
 
 impl Default for KvRouterConfig {
@@ -195,6 +235,19 @@ impl Default for KvRouterConfig {
             use_strata_routing: false, // original Dynamo: only GPU cache hit
             strata_cpu_overlap_weight: 0.9,
             strata_cxl_overlap_weight: 0.8,
+            strata_prefetch_overlap_weight: 0.5,
+            strata_load_aware_shared_cpu: false,
+            strata_randomize_ties: false,
+            enable_background_offload: false,
+            background_offload_dry_run: true,
+            offload_interval_ms: 5_000,
+            offload_window_ms: 10_000,
+            offload_hot_request_threshold: 5,
+            offload_owner_load_threshold: 10,
+            offload_top_k: 100,
+            offload_max_chunks: 8,
+            offload_max_inflight: 2,
+            offload_cooldown_secs: 30,
         }
     }
 }
@@ -219,6 +272,19 @@ impl KvRouterConfig {
         use_strata_routing: Option<bool>,
         strata_cpu_overlap_weight: Option<f64>,
         strata_cxl_overlap_weight: Option<f64>,
+        strata_prefetch_overlap_weight: Option<f64>,
+        strata_load_aware_shared_cpu: Option<bool>,
+        strata_randomize_ties: Option<bool>,
+        enable_background_offload: Option<bool>,
+        background_offload_dry_run: Option<bool>,
+        offload_interval_ms: Option<u64>,
+        offload_window_ms: Option<u64>,
+        offload_hot_request_threshold: Option<u32>,
+        offload_owner_load_threshold: Option<u64>,
+        offload_top_k: Option<usize>,
+        offload_max_chunks: Option<usize>,
+        offload_max_inflight: Option<usize>,
+        offload_cooldown_secs: Option<u64>,
     ) -> Self {
         let default = Self::default();
         Self {
@@ -243,6 +309,25 @@ impl KvRouterConfig {
                 .unwrap_or(default.strata_cpu_overlap_weight),
             strata_cxl_overlap_weight: strata_cxl_overlap_weight
                 .unwrap_or(default.strata_cxl_overlap_weight),
+            strata_prefetch_overlap_weight: strata_prefetch_overlap_weight
+                .unwrap_or(default.strata_prefetch_overlap_weight),
+            strata_load_aware_shared_cpu: strata_load_aware_shared_cpu
+                .unwrap_or(default.strata_load_aware_shared_cpu),
+            strata_randomize_ties: strata_randomize_ties.unwrap_or(default.strata_randomize_ties),
+            enable_background_offload: enable_background_offload
+                .unwrap_or(default.enable_background_offload),
+            background_offload_dry_run: background_offload_dry_run
+                .unwrap_or(default.background_offload_dry_run),
+            offload_interval_ms: offload_interval_ms.unwrap_or(default.offload_interval_ms),
+            offload_window_ms: offload_window_ms.unwrap_or(default.offload_window_ms),
+            offload_hot_request_threshold: offload_hot_request_threshold
+                .unwrap_or(default.offload_hot_request_threshold),
+            offload_owner_load_threshold: offload_owner_load_threshold
+                .unwrap_or(default.offload_owner_load_threshold),
+            offload_top_k: offload_top_k.unwrap_or(default.offload_top_k),
+            offload_max_chunks: offload_max_chunks.unwrap_or(default.offload_max_chunks),
+            offload_max_inflight: offload_max_inflight.unwrap_or(default.offload_max_inflight),
+            offload_cooldown_secs: offload_cooldown_secs.unwrap_or(default.offload_cooldown_secs),
         }
     }
 
@@ -300,6 +385,10 @@ impl Indexer {
                 gpu_scores: HashMap::new(),
                 cpu_scores: HashMap::new(),
                 cxl_scores: HashMap::new(),
+                cxl_resident_scores: HashMap::new(),
+                cpu_and_cxl_scores: HashMap::new(),
+                prefetch_inflight_scores: HashMap::new(),
+                block_residency: HashMap::new(),
                 gpu_and_cpu_scores: HashMap::new(),
                 scores: HashMap::new(),
                 frequencies: Vec::new(),
@@ -352,6 +441,16 @@ pub struct KvRouter {
     client: Client,
 
     worker_query_client: Option<WorkerQueryClient>,
+
+    background_offload: Option<Arc<BackgroundOffloadPlanner>>,
+    cxl_prefetch_client: Arc<CxlPrefetchClient>,
+    prefetch_hint_dispatcher: Option<Arc<PrefetchHintDispatcher>>,
+    global_prefetcher: Option<Arc<GlobalPrefetchManager>>,
+    prefetch_route_epoch: AtomicU64,
+    prefetch_routes: Mutex<HashMap<String, (Vec<WorkerWithDpRank>, u64, Vec<PrefetchReservation>)>>,
+    /// Reservations are a router-local, synchronous view of hints that have
+    /// been sent but whose LMCache events have not arrived yet.
+    virtual_prefetch: Arc<Mutex<HashMap<(WorkerWithDpRank, LocalBlockHash), usize>>>,
 }
 
 impl KvRouter {
@@ -365,8 +464,39 @@ impl KvRouter {
         router_id: u64,
     ) -> Result<Self> {
         let kv_router_config = kv_router_config.unwrap_or_default();
+        let prefetch_hint_dispatcher = PrefetchHintDispatcher::from_env();
+        let global_prefetcher = GlobalPrefetchManager::from_env(prefetch_hint_dispatcher.clone());
+        if global_prefetcher.is_some() {
+            let prefetch_chunk_size = env::var("DYN_GLOBAL_PREFETCH_CHUNK_SIZE")
+                .ok()
+                .and_then(|value| value.parse::<u32>().ok())
+                .unwrap_or(256);
+            if prefetch_chunk_size != block_size {
+                anyhow::bail!(
+                    "global prefetch requires Dynamo block_size == LMCache chunk_size; \
+                     router block_size={} DYN_GLOBAL_PREFETCH_CHUNK_SIZE={}",
+                    block_size,
+                    prefetch_chunk_size
+                );
+            }
+        }
         let component = endpoint.component();
+        let cxl_prefetch_client = Arc::new(CxlPrefetchClient::new(component.clone())?);
+        if cxl_prefetch_client.lookahead_enabled()
+            && cxl_prefetch_client.chunk_size() != block_size as usize
+        {
+            anyhow::bail!(
+                "waiting-route CXL prefetch requires Dynamo block_size == LMCache chunk_size; \
+                 router block_size={} DYN_CXL_PREFETCH_CHUNK_SIZE={}",
+                block_size,
+                cxl_prefetch_client.chunk_size(),
+            );
+        }
         let cancellation_token = component.drt().primary_token();
+        let background_offload = BackgroundOffloadPlanner::from_config(kv_router_config);
+        if let Some(planner) = &background_offload {
+            planner.start(cancellation_token.clone());
+        }
 
         // Watch for runtime config updates via discovery interface
         // (still needed for WorkerQueryClient and background tasks)
@@ -417,6 +547,7 @@ impl KvRouter {
             block_size,
             workers_with_configs.clone(),
             selector,
+            Arc::clone(&cxl_prefetch_client),
             kv_router_config.router_replica_sync,
             router_id,
         )
@@ -519,12 +650,196 @@ impl KvRouter {
             cancellation_token,
             client,
             worker_query_client: Some(worker_query_client),
+            background_offload,
+            cxl_prefetch_client,
+            prefetch_hint_dispatcher,
+            global_prefetcher,
+            prefetch_route_epoch: AtomicU64::new(0),
+            prefetch_routes: Mutex::new(HashMap::new()),
+            virtual_prefetch: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
     /// Get a reference to the client used by this KvRouter
     pub fn client(&self) -> &Client {
         &self.client
+    }
+
+    /// Cancel a route-time hint after a reservation is rerouted.
+    pub fn cancel_prefetch_hint(
+        &self,
+        request_id: String,
+        worker: WorkerWithDpRank,
+        route_epoch: u64,
+    ) {
+        if let Some(dispatcher) = &self.prefetch_hint_dispatcher {
+            dispatcher.cancel(request_id, worker, route_epoch);
+        }
+    }
+
+    fn issue_prefetch_for_route(
+        &self,
+        request_id: &str,
+        session_id: Option<&str>,
+        model_id: Option<&str>,
+        tokens: &[u32],
+        worker: WorkerWithDpRank,
+        candidates: &[WorkerPrefetchCandidate],
+    ) {
+        if tokens.is_empty() {
+            tracing::debug!(
+                request_id,
+                "Skipping route prefetch bookkeeping for empty token sequence"
+            );
+            return;
+        }
+        if self.global_prefetcher.is_none() && self.prefetch_hint_dispatcher.is_none() {
+            return;
+        }
+        let route_epoch = self.prefetch_route_epoch.fetch_add(1, Ordering::Relaxed) + 1;
+        let release_virtual_prefetch = Arc::clone(&self.virtual_prefetch);
+        let release_callback: Arc<dyn Fn(&[PrefetchReservation]) + Send + Sync + 'static> =
+            Arc::new(move |reservations| {
+                let Ok(mut virtual_prefetch) = release_virtual_prefetch.lock() else {
+                    tracing::warn!(
+                        "Unable to release virtual prefetch reservation: mutex poisoned"
+                    );
+                    return;
+                };
+                for reservation in reservations {
+                    for block_hash in &reservation.block_hashes {
+                        let key = (reservation.worker, *block_hash);
+                        let remove = match virtual_prefetch.get_mut(&key) {
+                            Some(count) if *count > 1 => {
+                                *count -= 1;
+                                false
+                            }
+                            Some(_) => true,
+                            None => false,
+                        };
+                        if remove {
+                            virtual_prefetch.remove(&key);
+                        }
+                    }
+                }
+            });
+        let dispatch = if let Some(global_prefetcher) = &self.global_prefetcher {
+            global_prefetcher.on_route_committed(
+                request_id,
+                session_id,
+                model_id.unwrap_or(""),
+                tokens,
+                worker,
+                candidates,
+                route_epoch,
+                None,
+                None,
+                |reservations| self.register_virtual_prefetch(reservations),
+                release_callback,
+            )
+        } else if let Some(dispatcher) = &self.prefetch_hint_dispatcher {
+            dispatcher.dispatch(
+                tokens.to_vec(),
+                Some(request_id.to_string()),
+                worker,
+                route_epoch,
+                None,
+            );
+            GlobalPrefetchDispatch {
+                cancel_workers: vec![worker],
+                reservations: Vec::new(),
+            }
+        } else {
+            GlobalPrefetchDispatch::default()
+        };
+
+        let (previous, evicted) = self
+            .prefetch_routes
+            .lock()
+            .map(|mut routes| {
+                let old = routes.insert(
+                    request_id.to_string(),
+                    (dispatch.cancel_workers, route_epoch, dispatch.reservations),
+                );
+                let mut evicted = None;
+                if routes.len() > 100_000 {
+                    if let Some(first) = routes.keys().next().cloned() {
+                        evicted = routes.remove(&first);
+                    }
+                }
+                (old, evicted)
+            })
+            .unwrap_or((None, None));
+        if let Some((_, _, evicted_reservations)) = evicted {
+            // Evicting the request bookkeeping must not release an active
+            // temporal reservation. Its physical-task callback owns release.
+            drop(evicted_reservations);
+        }
+        if let Some((old_workers, old_epoch, old_reservations)) = previous {
+            if let Some(dispatcher) = &self.prefetch_hint_dispatcher {
+                for old_worker in old_workers {
+                    dispatcher.cancel(request_id.to_string(), old_worker, old_epoch);
+                }
+            }
+            // Temporal reservations deliberately outlive the triggering
+            // request. Their failure callback owns release; dropping the
+            // route record here must not erase router awareness early.
+            drop(old_reservations);
+        }
+    }
+
+    fn register_virtual_prefetch(&self, reservations: &[PrefetchReservation]) {
+        let Ok(mut virtual_prefetch) = self.virtual_prefetch.lock() else {
+            tracing::warn!("Unable to register virtual prefetch reservation: mutex poisoned");
+            return;
+        };
+        for reservation in reservations {
+            for block_hash in &reservation.block_hashes {
+                let entry = virtual_prefetch
+                    .entry((reservation.worker, *block_hash))
+                    .or_insert(0);
+                *entry = entry.saturating_add(1);
+            }
+        }
+    }
+
+    /// Overlay reservations before scheduling a request. This is the
+    /// synchronous Dynamo-side view that bridges the gap before LMCache emits
+    /// its eventual Prefetch/CPU event. A block is counted once per worker,
+    /// even if multiple requests reserved it.
+    fn apply_virtual_prefetch_scores(
+        &self,
+        block_hashes: &[LocalBlockHash],
+        scores: &mut OverlapScores,
+    ) {
+        let Ok(virtual_prefetch) = self.virtual_prefetch.lock() else {
+            tracing::warn!("Unable to apply virtual prefetch reservation: mutex poisoned");
+            return;
+        };
+        Self::overlay_virtual_prefetch_scores(&virtual_prefetch, block_hashes, scores);
+    }
+
+    /// Pure overlay operation, kept separate so the synchronous reservation
+    /// contract can be tested without constructing a live KvRouter.
+    fn overlay_virtual_prefetch_scores(
+        virtual_prefetch: &HashMap<(WorkerWithDpRank, LocalBlockHash), usize>,
+        block_hashes: &[LocalBlockHash],
+        scores: &mut OverlapScores,
+    ) {
+        for block_hash in block_hashes {
+            for ((worker, reserved_hash), count) in virtual_prefetch.iter() {
+                if reserved_hash != block_hash || *count == 0 {
+                    continue;
+                }
+                *scores.prefetch_inflight_scores.entry(*worker).or_insert(0) += 1;
+                // Preserve legacy kv-mode visibility as well. kv-strata uses
+                // prefetch_inflight_scores with its configured weight; kv mode
+                // has no separate tier score and therefore needs this direct
+                // overlap signal to be route-aware.
+                *scores.scores.entry(*worker).or_insert(0) += 1;
+                scores.tree_sizes.entry(*worker).or_insert(0);
+            }
+        }
     }
 
     /// Give these tokens, find the worker with the best match in it's KV cache.
@@ -537,6 +852,52 @@ impl KvRouter {
         router_config_override: Option<&RouterConfigOverride>,
         update_states: bool,
     ) -> anyhow::Result<(WorkerWithDpRank, u32)> {
+        self.find_best_match_with_session(
+            context_id,
+            None,
+            None,
+            tokens,
+            router_config_override,
+            update_states,
+        )
+        .await
+    }
+
+    /// Route a request while optionally supplying a stable conversation/session
+    /// identity to the router-owned global prefetch manager.
+    pub async fn find_best_match_with_session(
+        &self,
+        context_id: Option<&str>,
+        session_id: Option<&str>,
+        model_id: Option<&str>,
+        tokens: &[u32],
+        router_config_override: Option<&RouterConfigOverride>,
+        update_states: bool,
+    ) -> anyhow::Result<(WorkerWithDpRank, u32)> {
+        let (best_worker, overlap_amount) = self
+            .find_best_match_with_session_details(
+                context_id,
+                session_id,
+                model_id,
+                tokens,
+                router_config_override,
+                update_states,
+            )
+            .await?;
+        Ok((best_worker, overlap_amount))
+    }
+
+    /// Route while retaining the bounded token prefix needed by the
+    /// waiting-route lookahead scheduler.
+    pub async fn find_best_match_with_session_details(
+        &self,
+        context_id: Option<&str>,
+        session_id: Option<&str>,
+        model_id: Option<&str>,
+        tokens: &[u32],
+        router_config_override: Option<&RouterConfigOverride>,
+        update_states: bool,
+    ) -> anyhow::Result<(WorkerWithDpRank, u32)> {
         // Validate that context_id is provided when update_states is true
         if update_states && context_id.is_none() {
             panic!("context_id must be provided if update_states is true");
@@ -545,24 +906,60 @@ impl KvRouter {
         let isl_tokens = tokens.len();
 
         let block_hashes = compute_block_hash_for_seq(tokens, self.block_size, None);
-        let overlap_scores = self.indexer.find_matches(block_hashes).await?;
+        let mut overlap_scores = self.indexer.find_matches(block_hashes.clone()).await?;
+        self.apply_virtual_prefetch_scores(&block_hashes, &mut overlap_scores);
 
         // Compute seq_hashes only if scheduler needs it for active blocks tracking
         let maybe_seq_hashes = self
             .kv_router_config
             .compute_seq_hashes_for_tracking(tokens, self.block_size);
 
-        let best_worker = self
+        // Raw token IDs are normally carried only for an enabled lookahead
+        // client.  Timeline validation also needs them in baseline so the
+        // waiting-candidate denominator is measured at the same queue point;
+        // this remains default-off with the timeline flag.
+        let timeline_enabled = env::var("DYN_CXL_PREFETCH_TIMELINE_ENABLED")
+            .ok()
+            .and_then(|value| value.parse::<bool>().ok())
+            .unwrap_or(false);
+        let prefetch_token_ids = (self.cxl_prefetch_client.lookahead_enabled() || timeline_enabled)
+            .then(|| tokens.to_vec());
+        let scheduling_response = self
             .scheduler
-            .schedule(
+            .schedule_with_details_and_tokens(
                 context_id.map(|s| s.to_string()),
                 isl_tokens,
                 maybe_seq_hashes,
                 overlap_scores.clone(),
                 router_config_override,
                 update_states,
+                prefetch_token_ids,
             )
             .await?;
+        let best_worker = scheduling_response.best_worker;
+        let prefetch_candidates = build_prefetch_candidates(&overlap_scores, best_worker);
+
+        if update_states && let Some(planner) = &self.background_offload {
+            planner.observe(
+                tokens,
+                self.block_size,
+                best_worker,
+                &overlap_scores,
+                &scheduling_response.decode_blocks,
+                &scheduling_response.prefill_tokens,
+            );
+        }
+
+        if update_states && let Some(request_id) = context_id {
+            self.issue_prefetch_for_route(
+                request_id,
+                session_id,
+                model_id,
+                tokens,
+                best_worker,
+                &prefetch_candidates,
+            );
+        }
 
         // Note: Routing decision recording (for approximate mode) is now handled
         // by KvPushRouter::generate after select_worker returns.
@@ -610,6 +1007,27 @@ impl KvRouter {
     }
 
     pub async fn free(&self, request_id: &str) -> Result<(), SequenceError> {
+        if let Some(dispatcher) = &self.prefetch_hint_dispatcher
+            && let Some((workers, epoch, reservations)) = self
+                .prefetch_routes
+                .lock()
+                .ok()
+                .and_then(|mut routes| routes.remove(request_id))
+        {
+            for worker in workers {
+                dispatcher.cancel(request_id.to_string(), worker, epoch);
+            }
+            // Temporal reservations outlive request cleanup. They are
+            // released only by the physical prefetch failure callback.
+            drop(reservations);
+        } else if let Some((_, _, reservations)) = self
+            .prefetch_routes
+            .lock()
+            .ok()
+            .and_then(|mut routes| routes.remove(request_id))
+        {
+            drop(reservations);
+        }
         self.scheduler.free(request_id).await
     }
 
@@ -635,7 +1053,8 @@ impl KvRouter {
         worker: WorkerWithDpRank,
     ) -> Result<u32, KvRouterError> {
         let block_hashes = compute_block_hash_for_seq(tokens, self.block_size, None);
-        let overlap_scores = self.indexer.find_matches(block_hashes).await?;
+        let mut overlap_scores = self.indexer.find_matches(block_hashes.clone()).await?;
+        self.apply_virtual_prefetch_scores(&block_hashes, &mut overlap_scores);
         Ok(overlap_scores.scores.get(&worker).copied().unwrap_or(0))
     }
 
@@ -754,6 +1173,61 @@ impl AsyncEngine<SingleIn<RouterRequest>, ManyOut<Annotated<RouterResponse>>, Er
     }
 }
 
+/// Build the worker candidates used by the global prefetch target selector.
+///
+/// The index stores aggregate counts by tier rather than the exact set of
+/// chunks in every tier. We therefore use the largest of the CPU, GPU, and
+/// already-inflight estimates as a conservative resident count. This keeps the
+/// selector bounded and avoids double-counting the same chunk across tiers.
+fn build_prefetch_candidates(
+    scores: &OverlapScores,
+    fallback: WorkerWithDpRank,
+) -> Vec<WorkerPrefetchCandidate> {
+    let mut workers = HashSet::new();
+    for map in [
+        &scores.gpu_scores,
+        &scores.cpu_scores,
+        &scores.cxl_scores,
+        &scores.cxl_resident_scores,
+        &scores.cpu_and_cxl_scores,
+        &scores.prefetch_inflight_scores,
+        &scores.gpu_and_cpu_scores,
+        &scores.scores,
+    ] {
+        workers.extend(map.keys().copied());
+    }
+    workers.extend(scores.tree_sizes.keys().copied());
+    workers.insert(fallback);
+
+    workers
+        .into_iter()
+        .map(|worker| {
+            let cpu = scores
+                .cpu_scores
+                .get(&worker)
+                .copied()
+                .unwrap_or(0)
+                .saturating_add(scores.cpu_and_cxl_scores.get(&worker).copied().unwrap_or(0));
+            let gpu = scores
+                .gpu_scores
+                .get(&worker)
+                .copied()
+                .unwrap_or(0)
+                .saturating_add(scores.gpu_and_cpu_scores.get(&worker).copied().unwrap_or(0));
+            let inflight = scores
+                .prefetch_inflight_scores
+                .get(&worker)
+                .copied()
+                .unwrap_or(0);
+            WorkerPrefetchCandidate {
+                worker,
+                resident_chunks: cpu.max(gpu).max(inflight),
+                prefetch_inflight_chunks: inflight,
+            }
+        })
+        .collect()
+}
+
 pub struct KvPushRouter {
     inner: PushRouter<PreprocessedRequest, Annotated<LLMEngineOutput>>,
     pub chooser: Arc<KvRouter>,
@@ -787,6 +1261,19 @@ impl KvPushRouter {
         handle_local_updates: bool,
     ) -> Result<WorkerSelection, Error> {
         let routing = request.routing.as_ref();
+        let session_id = request
+            .extra_args
+            .as_ref()
+            .and_then(|params| params.get("lmcache.session_id"))
+            .and_then(|value| value.as_str())
+            .or_else(|| {
+                request
+                    .extra_args
+                    .as_ref()
+                    .and_then(|params| params.get("kv_transfer_params"))
+                    .and_then(|params| params.get("lmcache.session_id"))
+                    .and_then(|value| value.as_str())
+            });
 
         // Get pre-selected worker based on phase, with backend_instance_id as fallback
         let Some(id) = (match phase {
@@ -802,8 +1289,10 @@ impl KvPushRouter {
             // Don't update states if this is a query-only request
             let (best_worker, overlap_amount) = self
                 .chooser
-                .find_best_match(
+                .find_best_match_with_session_details(
                     Some(context_id),
+                    session_id,
+                    Some(&request.model),
                     &request.token_ids,
                     request.router_config_override.as_ref(),
                     !is_query_only,
@@ -827,7 +1316,7 @@ impl KvPushRouter {
 
         // Route to pre-selected or explicitly specified worker
         let dp_rank = routing.and_then(|r| r.dp_rank).unwrap_or(0);
-        
+
         tracing::info!(
             "Routing decision: Using pre-selected worker_id={} dp_rank={:?} (phase={:?})",
             id,
@@ -847,6 +1336,17 @@ impl KvPushRouter {
             .chooser
             .get_overlap_blocks(&request.token_ids, worker)
             .await?;
+
+        if !is_query_only && handle_local_updates {
+            self.chooser.issue_prefetch_for_route(
+                context_id,
+                session_id,
+                Some(&request.model),
+                &request.token_ids,
+                worker,
+                &[],
+            );
+        }
 
         // Extract expected_output_tokens from routing hints
         let expected_output_tokens = request
@@ -1018,6 +1518,7 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutpu
 
         let chooser = self.chooser.clone();
         let mut response_stream = self.inner.direct(updated_request, instance_id).await?;
+
         let stream_context = response_stream.context();
         let context_for_monitoring = stream_context.clone();
 
@@ -1103,5 +1604,47 @@ impl Drop for KvRouter {
     fn drop(&mut self) {
         tracing::info!("Dropping KvRouter - cancelling background tasks");
         self.cancellation_token.cancel();
+    }
+}
+
+#[cfg(test)]
+mod virtual_prefetch_tests {
+    use super::{KvRouter, OverlapScores};
+    use crate::kv_router::protocols::{LocalBlockHash, WorkerWithDpRank};
+    use std::collections::HashMap;
+
+    #[test]
+    fn virtual_reservation_is_visible_to_route_scores_before_events() {
+        let worker = WorkerWithDpRank::new(7, 0);
+        let mut reservations = HashMap::new();
+        reservations.insert((worker, LocalBlockHash(42)), 1usize);
+        let mut scores = OverlapScores::new();
+
+        KvRouter::overlay_virtual_prefetch_scores(
+            &reservations,
+            &[LocalBlockHash(42), LocalBlockHash(99)],
+            &mut scores,
+        );
+
+        assert_eq!(scores.prefetch_inflight_scores.get(&worker), Some(&1));
+        assert_eq!(scores.scores.get(&worker), Some(&1));
+        assert_eq!(scores.tree_sizes.get(&worker), Some(&0));
+    }
+
+    #[test]
+    fn unrelated_chunks_do_not_receive_virtual_overlap() {
+        let worker = WorkerWithDpRank::new(7, 0);
+        let mut reservations = HashMap::new();
+        reservations.insert((worker, LocalBlockHash(42)), 1usize);
+        let mut scores = OverlapScores::new();
+
+        KvRouter::overlay_virtual_prefetch_scores(
+            &reservations,
+            &[LocalBlockHash(99)],
+            &mut scores,
+        );
+
+        assert!(scores.prefetch_inflight_scores.is_empty());
+        assert!(scores.scores.is_empty());
     }
 }

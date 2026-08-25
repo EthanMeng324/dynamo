@@ -194,6 +194,22 @@ impl Flags {
                 None,
                 None,
                 None,
+                None, // use_strata_routing
+                None, // strata_cpu_overlap_weight
+                None, // strata_cxl_overlap_weight
+                None, // strata_prefetch_overlap_weight
+                None, // strata_load_aware_shared_cpu
+                None, // strata_randomize_ties
+                None, // enable_background_offload
+                None, // background_offload_dry_run
+                None, // offload_interval_ms
+                None, // offload_window_ms
+                None, // offload_hot_request_threshold
+                None, // offload_owner_load_threshold
+                None, // offload_top_k
+                None, // offload_max_chunks
+                None, // offload_max_inflight
+                None, // offload_cooldown_secs
             ),
         )
     }

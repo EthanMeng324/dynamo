@@ -169,7 +169,47 @@ pub(crate) struct WorkerBlockInfo {
     cpu_block_hash: Option<ExternalSequenceBlockHash>,
     /// External hash for the CXL-resident copy of this block (if present).
     cxl_block_hash: Option<ExternalSequenceBlockHash>,
+    /// A copy has been issued to this worker but is not CPU-ready yet.
+    prefetch_inflight_hash: Option<ExternalSequenceBlockHash>,
 }
+
+/// Per-request residency metadata for a matched block.
+///
+/// Aggregate tier scores are sufficient for normal routing, but they lose the
+/// distinction between a block that is CXL-only and a block that is already
+/// present in the selected worker's LocalCPU/GPU cache.  Waiting-route
+/// lookahead uses this bounded metadata to avoid issuing a hint for the latter
+/// case.  The local block hash is the router-side identity only; LMCache still
+/// receives token IDs and derives its own CacheEngineKey.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BlockResidencyMetadata {
+    /// Zero-based position in the matched request prefix.
+    pub block_index: u32,
+    pub block_hash: LocalBlockHash,
+    #[serde(default)]
+    pub gpu: bool,
+    #[serde(default)]
+    pub cpu: bool,
+    #[serde(default)]
+    pub cxl: bool,
+    #[serde(default)]
+    pub prefetch_inflight: bool,
+}
+
+impl BlockResidencyMetadata {
+    /// A block that can benefit from a CXL-to-LocalCPU promotion on this
+    /// worker.  GPU/CPU residency and an existing speculative copy all make a
+    /// new waiting-route hint redundant.
+    pub fn cxl_only(&self) -> bool {
+        self.cxl && !self.gpu && !self.cpu && !self.prefetch_inflight
+    }
+}
+
+/// Keep query metadata bounded independently of prompt length.  The
+/// waiting-route client currently admits at most 8 chunks by default, so this
+/// leaves room for configured values while preventing a long prompt from
+/// multiplying worker-by-block metadata without a bound.
+const MAX_BLOCK_RESIDENCY_METADATA: usize = 64;
 
 /// A block in the Radix Tree.
 #[derive(Debug)]
@@ -301,7 +341,19 @@ impl RadixTree {
             .unwrap_or(false)
     }
 
-    fn find_block_in_any_lookup(&self, block_hash: ExternalSequenceBlockHash) -> Option<SharedRadixBlock> {
+    fn is_prefetch_inflight_medium(medium: Option<&str>) -> bool {
+        medium
+            .map(|m| {
+                m.eq_ignore_ascii_case("PREFETCH_INFLIGHT")
+                    || m.eq_ignore_ascii_case("CPU_PREFETCH_INFLIGHT")
+            })
+            .unwrap_or(false)
+    }
+
+    fn find_block_in_any_lookup(
+        &self,
+        block_hash: ExternalSequenceBlockHash,
+    ) -> Option<SharedRadixBlock> {
         self.lookup
             .values()
             .find_map(|worker_blocks| worker_blocks.get(&block_hash).cloned())
@@ -356,9 +408,11 @@ impl RadixTree {
             if let Some(block) = next_block {
                 {
                     let block_borrow = block.borrow();
-                    scores.update_scores(
+                    scores.update_scores_at(
                         block_borrow.workers.iter(),
                         self.use_strata_routing,
+                        idx,
+                        *block_hash,
                     );
                 } // block_borrow is dropped here
 
@@ -394,11 +448,22 @@ impl RadixTree {
             }
         }
 
-        tracing::info!("RadixTree::find_matches: final GPU scores={:?}, CPU scores={:?}", scores.gpu_scores, scores.cpu_scores);
+        tracing::info!(
+            "RadixTree::find_matches: final GPU scores={:?}, CPU scores={:?}",
+            scores.gpu_scores,
+            scores.cpu_scores
+        );
 
         // Populate tree sizes for all workers that have scores (from either GPU or CPU)
-        let all_workers: Vec<_> = scores.gpu_scores.keys()
+        let all_workers: Vec<_> = scores
+            .gpu_scores
+            .keys()
             .chain(scores.cpu_scores.keys())
+            .chain(scores.cxl_scores.keys())
+            .chain(scores.cxl_resident_scores.keys())
+            .chain(scores.cpu_and_cxl_scores.keys())
+            .chain(scores.prefetch_inflight_scores.keys())
+            .chain(scores.block_residency.keys())
             .copied()
             .collect();
         for worker in all_workers {
@@ -444,7 +509,10 @@ impl RadixTree {
                 KvCacheEventData::Cleared => true,
             };
             if !medium_is_gpu {
-                tracing::trace!(id, "RadixTree::apply_event: skipping non-GPU event in kv mode");
+                tracing::trace!(
+                    id,
+                    "RadixTree::apply_event: skipping non-GPU event in kv mode"
+                );
                 return Ok(());
             }
         }
@@ -461,22 +529,20 @@ impl RadixTree {
                 let mut current = match op.parent_hash {
                     Some(parent) => match self.lookup.get(&worker).and_then(|m| m.get(&parent)) {
                         Some(current) => current.clone(),
-                        None if parent_is_cxl => {
-                            match self.find_block_in_any_lookup(parent) {
-                                Some(current) => current,
-                                None => {
-                                    tracing::warn!(
-                                        worker_id = worker.worker_id.to_string(),
-                                        dp_rank = worker.dp_rank,
-                                        id,
-                                        parent_hash = ?op.parent_hash,
-                                        num_blocks = op.blocks.len(),
-                                        "Failed to find CXL parent block globally; skipping store operation"
-                                    );
-                                    return Err(KvCacheEventError::ParentBlockNotFound);
-                                }
+                        None if parent_is_cxl => match self.find_block_in_any_lookup(parent) {
+                            Some(current) => current,
+                            None => {
+                                tracing::warn!(
+                                    worker_id = worker.worker_id.to_string(),
+                                    dp_rank = worker.dp_rank,
+                                    id,
+                                    parent_hash = ?op.parent_hash,
+                                    num_blocks = op.blocks.len(),
+                                    "Failed to find CXL parent block globally; skipping store operation"
+                                );
+                                return Err(KvCacheEventError::ParentBlockNotFound);
                             }
-                        }
+                        },
                         None => {
                             tracing::warn!(
                                 worker_id = worker.worker_id.to_string(),
@@ -625,12 +691,32 @@ impl RadixTree {
                                             gpu_block_hash: None,
                                             cpu_block_hash: None,
                                             cxl_block_hash: Some(block_data.block_hash),
+                                            prefetch_inflight_hash: None,
                                         });
                                     self.lookup
                                         .entry(target_worker)
                                         .or_default()
                                         .insert(block_data.block_hash, child.clone());
                                 }
+                            } else if Self::is_prefetch_inflight_medium(
+                                block_data.medium.as_deref(),
+                            ) {
+                                child_mut
+                                    .workers
+                                    .entry(worker)
+                                    .and_modify(|info| {
+                                        info.prefetch_inflight_hash = Some(block_data.block_hash);
+                                    })
+                                    .or_insert_with(|| WorkerBlockInfo {
+                                        gpu_block_hash: None,
+                                        cpu_block_hash: None,
+                                        cxl_block_hash: None,
+                                        prefetch_inflight_hash: Some(block_data.block_hash),
+                                    });
+                                self.lookup
+                                    .entry(worker)
+                                    .or_default()
+                                    .insert(block_data.block_hash, child.clone());
                             } else {
                                 child_mut
                                     .workers
@@ -646,6 +732,7 @@ impl RadixTree {
                                         gpu_block_hash: is_gpu.then_some(block_data.block_hash),
                                         cpu_block_hash: (!is_gpu).then_some(block_data.block_hash),
                                         cxl_block_hash: None,
+                                        prefetch_inflight_hash: None,
                                     });
                                 // Add the block to the worker's lookup table (only when we store)
                                 self.lookup
@@ -668,11 +755,13 @@ impl RadixTree {
                     Gpu,
                     Cpu,
                     Cxl,
+                    Prefetch,
                     Both,
                 }
                 let remove_tier = match remove.medium.as_deref() {
                     Some(m) if m.eq_ignore_ascii_case("GPU") => RemoveTier::Gpu,
                     Some(m) if m.eq_ignore_ascii_case("CXL") => RemoveTier::Cxl,
+                    Some(m) if Self::is_prefetch_inflight_medium(Some(m)) => RemoveTier::Prefetch,
                     Some(_) => RemoveTier::Cpu,
                     None => {
                         tracing::warn!(
@@ -694,7 +783,12 @@ impl RadixTree {
 
                     let mut removed_any = false;
                     for target_worker in target_workers {
-                        let entry = match self.lookup.get(&target_worker).and_then(|m| m.get(&block)).cloned() {
+                        let entry = match self
+                            .lookup
+                            .get(&target_worker)
+                            .and_then(|m| m.get(&block))
+                            .cloned()
+                        {
                             Some(entry) => entry,
                             None => continue,
                         };
@@ -728,6 +822,13 @@ impl RadixTree {
                                 }
                                 matched
                             }
+                            RemoveTier::Prefetch => {
+                                let matched = info.prefetch_inflight_hash == Some(block);
+                                if matched {
+                                    info.prefetch_inflight_hash = None;
+                                }
+                                matched
+                            }
                             RemoveTier::Both => {
                                 let mut matched = false;
                                 if info.gpu_block_hash == Some(block) {
@@ -754,7 +855,8 @@ impl RadixTree {
                         // Remove worker entry only if no tiers remain for this worker on this block.
                         let no_tiers_left = info.gpu_block_hash.is_none()
                             && info.cpu_block_hash.is_none()
-                            && info.cxl_block_hash.is_none();
+                            && info.cxl_block_hash.is_none()
+                            && info.prefetch_inflight_hash.is_none();
                         if no_tiers_left {
                             guard.workers.remove(&target_worker);
                         }
@@ -764,9 +866,7 @@ impl RadixTree {
                             guard.children.clear();
                         }
                         // Remove lookup entry only when this worker no longer has this block in any tier.
-                        if no_tiers_left
-                            && let Some(lookup) = self.lookup.get_mut(&target_worker)
-                        {
+                        if no_tiers_left && let Some(lookup) = self.lookup.get_mut(&target_worker) {
                             lookup.remove(&block);
                         }
                     }
@@ -878,8 +978,14 @@ impl RadixTree {
                     (block_info.gpu_block_hash, Some("GPU".to_string())),
                     (block_info.cpu_block_hash, Some("CPU".to_string())),
                     (block_info.cxl_block_hash, Some("CXL".to_string())),
+                    (
+                        block_info.prefetch_inflight_hash,
+                        Some("PREFETCH_INFLIGHT".to_string()),
+                    ),
                 ] {
-                    let Some(block_hash) = tier_hash else { continue };
+                    let Some(block_hash) = tier_hash else {
+                        continue;
+                    };
 
                     let event = RouterEvent {
                         worker_id: worker_id.worker_id,
@@ -1024,6 +1130,27 @@ pub struct OverlapScores {
     // map of worker (with dp_rank) to CXL match count
     #[serde(default)]
     pub cxl_scores: HashMap<WorkerWithDpRank, u32>,
+    // map of worker to blocks with a CXL copy, regardless of whether the
+    // same block is also present on GPU and/or CPU.  The strata routing maps
+    // above are intentionally disjoint, but offload planning needs this
+    // residency fact independently of the routing bucket.
+    #[serde(default)]
+    pub cxl_resident_scores: HashMap<WorkerWithDpRank, u32>,
+    // map of worker to blocks present in both local CPU and shared CXL.
+    // Keeping this fact lets the scheduler relax CPU affinity under load.
+    #[serde(default)]
+    pub cpu_and_cxl_scores: HashMap<WorkerWithDpRank, u32>,
+    /// Blocks whose copy to this worker's CPU is currently inflight.
+    #[serde(default)]
+    pub prefetch_inflight_scores: HashMap<WorkerWithDpRank, u32>,
+    /// Bounded per-block tier metadata for the matched request prefix.
+    ///
+    /// This is intentionally separate from the aggregate score maps: a
+    /// waiting-route hint needs to know which exact blocks are CXL-only on the
+    /// predicted worker, rather than treating every CXL-visible block as a
+    /// promotion candidate.
+    #[serde(default)]
+    pub block_residency: HashMap<WorkerWithDpRank, Vec<BlockResidencyMetadata>>,
     // map of worker (with dp_rank) to blocks present in both GPU and CPU tiers
     #[serde(default)]
     pub gpu_and_cpu_scores: HashMap<WorkerWithDpRank, u32>,
@@ -1053,11 +1180,34 @@ impl OverlapScores {
             gpu_scores: HashMap::new(),
             cpu_scores: HashMap::new(),
             cxl_scores: HashMap::new(),
+            cxl_resident_scores: HashMap::new(),
+            cpu_and_cxl_scores: HashMap::new(),
+            prefetch_inflight_scores: HashMap::new(),
+            block_residency: HashMap::new(),
             gpu_and_cpu_scores: HashMap::new(),
             frequencies: Vec::with_capacity(32),
             tree_sizes: HashMap::new(),
             scores: HashMap::new(),
         }
+    }
+
+    /// Merge one shard's match result into a sharded-index result. Worker
+    /// assignments are stable per shard, so the per-worker maps can be
+    /// extended without double-counting a worker. Keeping this in one place
+    /// prevents newer tier metadata from silently disappearing at the shard
+    /// aggregation boundary.
+    pub(crate) fn merge_shard(&mut self, shard: Self) {
+        self.gpu_scores.extend(shard.gpu_scores);
+        self.cpu_scores.extend(shard.cpu_scores);
+        self.cxl_scores.extend(shard.cxl_scores);
+        self.cxl_resident_scores.extend(shard.cxl_resident_scores);
+        self.cpu_and_cxl_scores.extend(shard.cpu_and_cxl_scores);
+        self.prefetch_inflight_scores
+            .extend(shard.prefetch_inflight_scores);
+        self.block_residency.extend(shard.block_residency);
+        self.gpu_and_cpu_scores.extend(shard.gpu_and_cpu_scores);
+        self.scores.extend(shard.scores);
+        self.tree_sizes.extend(shard.tree_sizes);
     }
 
     /// Update the scores with worker block information.
@@ -1070,14 +1220,42 @@ impl OverlapScores {
     ///   that are present on the worker's GPU contribute to its score.
     ///   When true (kv-strata), bucket matches into disjoint GPU/CPU/CXL
     ///   categories so the scheduler can apply per-tier weights.
-    pub(crate) fn update_scores<'a, I>(&mut self, worker_blocks: I, use_strata_routing: bool)
-    where
+    /// Update aggregate scores and, when a request position is supplied,
+    /// retain bounded per-block residency metadata for lookahead decisions.
+    pub(crate) fn update_scores_at<'a, I>(
+        &mut self,
+        worker_blocks: I,
+        use_strata_routing: bool,
+        block_index: usize,
+        block_hash: LocalBlockHash,
+    ) where
         I: IntoIterator<Item = (&'a WorkerWithDpRank, &'a WorkerBlockInfo)>,
     {
         for (worker, block_info) in worker_blocks {
             let has_gpu = block_info.gpu_block_hash.is_some();
             let has_cpu = block_info.cpu_block_hash.is_some();
             let has_cxl = block_info.cxl_block_hash.is_some();
+            let has_prefetch = block_info.prefetch_inflight_hash.is_some();
+
+            let metadata = self.block_residency.entry(*worker).or_default();
+            if metadata.len() < MAX_BLOCK_RESIDENCY_METADATA {
+                metadata.push(BlockResidencyMetadata {
+                    block_index: block_index.min(u32::MAX as usize) as u32,
+                    block_hash,
+                    gpu: has_gpu,
+                    cpu: has_cpu,
+                    cxl: has_cxl,
+                    prefetch_inflight: has_prefetch,
+                });
+            }
+
+            // Keep CXL residency independent from the disjoint strata
+            // buckets.  In particular, GPU+CXL is not represented by
+            // cxl_scores, but it must still suppress a duplicate offload.
+            if has_cxl {
+                let score = self.cxl_resident_scores.entry(*worker).or_insert(0);
+                *score += 1;
+            }
 
             // kv-strata: record disjoint per-tier counts so the scheduler can
             // apply per-tier weights (priority: GPU > CPU > CXL).
@@ -1087,8 +1265,11 @@ impl OverlapScores {
             // they don't contribute to routing scores in kv mode.
             let count_gpu = has_gpu;
             let has_cpu_like = has_cpu || has_cxl;
-            let count_cpu = use_strata_routing && has_cpu && !has_gpu;
+            let count_cpu = use_strata_routing && has_cpu && !has_gpu && !has_cxl;
             let count_cxl = use_strata_routing && has_cxl && !has_gpu && !has_cpu;
+            let count_cpu_cxl = use_strata_routing && has_cpu && has_cxl && !has_gpu;
+            let count_prefetch =
+                use_strata_routing && has_prefetch && !has_gpu && !has_cpu && !has_cxl;
             let count_both = use_strata_routing && has_gpu && has_cpu_like;
 
             if count_gpu {
@@ -1103,11 +1284,19 @@ impl OverlapScores {
                 let score = self.cxl_scores.entry(*worker).or_insert(0);
                 *score += 1;
             }
+            if count_cpu_cxl {
+                let score = self.cpu_and_cxl_scores.entry(*worker).or_insert(0);
+                *score += 1;
+            }
+            if count_prefetch {
+                let score = self.prefetch_inflight_scores.entry(*worker).or_insert(0);
+                *score += 1;
+            }
             if count_both {
                 let score = self.gpu_and_cpu_scores.entry(*worker).or_insert(0);
                 *score += 1;
             }
-            if !(count_gpu || count_cpu || count_cxl) {
+            if !(count_gpu || count_cpu || count_cxl || count_cpu_cxl || count_prefetch) {
                 continue;
             }
 
@@ -2275,21 +2464,21 @@ impl KvIndexerInterface for KvIndexerSharded {
             for response_num in 0..self.event_tx.len() {
                 match match_rx.recv().await {
                     Some(response) => {
-                        scores.scores.extend(response.scores);
-                        scores.tree_sizes.extend(response.tree_sizes);
+                        let response_frequencies = response.frequencies.clone();
+                        scores.merge_shard(response);
 
                         if response_num == 0 {
-                            scores.frequencies = response.frequencies;
+                            scores.frequencies = response_frequencies;
                         } else {
-                            let diff = (response.frequencies.len() as i64)
+                            let diff = (response_frequencies.len() as i64)
                                 - (scores.frequencies.len() as i64);
 
                             if diff > 0 {
                                 scores.frequencies.extend(iter::repeat_n(0, diff as usize));
                             }
 
-                            for i in 0..response.frequencies.len() {
-                                scores.frequencies[i] += response.frequencies[i];
+                            for i in 0..response_frequencies.len() {
+                                scores.frequencies[i] += response_frequencies[i];
                             }
                         }
                     }
@@ -2434,6 +2623,86 @@ mod tests {
     use tokio::time;
     use tokio_util::sync::CancellationToken;
 
+    #[test]
+    fn dual_cpu_cxl_residency_is_preserved_for_scheduler_policy() {
+        let worker = WorkerWithDpRank::from_worker_id(7);
+        let info = WorkerBlockInfo {
+            gpu_block_hash: None,
+            cpu_block_hash: Some(ExternalSequenceBlockHash(11)),
+            cxl_block_hash: Some(ExternalSequenceBlockHash(11)),
+            prefetch_inflight_hash: None,
+        };
+        let mut scores = OverlapScores::new();
+        scores.update_scores_at([(&worker, &info)], true, 0, LocalBlockHash(11));
+
+        assert_eq!(scores.cpu_scores.get(&worker), None);
+        assert_eq!(scores.cxl_scores.get(&worker), None);
+        assert_eq!(scores.cxl_resident_scores.get(&worker), Some(&1));
+        assert_eq!(scores.cpu_and_cxl_scores.get(&worker), Some(&1));
+        assert_eq!(scores.scores.get(&worker), Some(&1));
+    }
+
+    #[test]
+    fn prefetch_inflight_is_worker_local_and_scored_separately() {
+        let worker = WorkerWithDpRank::from_worker_id(8);
+        let info = WorkerBlockInfo {
+            gpu_block_hash: None,
+            cpu_block_hash: None,
+            cxl_block_hash: None,
+            prefetch_inflight_hash: Some(ExternalSequenceBlockHash(22)),
+        };
+        let mut scores = OverlapScores::new();
+        scores.update_scores_at([(&worker, &info)], true, 0, LocalBlockHash(22));
+        assert_eq!(scores.prefetch_inflight_scores.get(&worker), Some(&1));
+        assert_eq!(scores.scores.get(&worker), Some(&1));
+        assert!(scores.cpu_scores.get(&worker).is_none());
+    }
+
+    #[test]
+    fn block_residency_metadata_excludes_local_and_inflight_copies() {
+        let worker = WorkerWithDpRank::from_worker_id(9);
+        let cxl_only = WorkerBlockInfo {
+            gpu_block_hash: None,
+            cpu_block_hash: None,
+            cxl_block_hash: Some(ExternalSequenceBlockHash(10)),
+            prefetch_inflight_hash: None,
+        };
+        let cpu_and_cxl = WorkerBlockInfo {
+            gpu_block_hash: None,
+            cpu_block_hash: Some(ExternalSequenceBlockHash(11)),
+            cxl_block_hash: Some(ExternalSequenceBlockHash(11)),
+            prefetch_inflight_hash: None,
+        };
+        let gpu_and_cxl = WorkerBlockInfo {
+            gpu_block_hash: Some(ExternalSequenceBlockHash(12)),
+            cpu_block_hash: None,
+            cxl_block_hash: Some(ExternalSequenceBlockHash(12)),
+            prefetch_inflight_hash: None,
+        };
+        let cxl_and_inflight = WorkerBlockInfo {
+            gpu_block_hash: None,
+            cpu_block_hash: None,
+            cxl_block_hash: Some(ExternalSequenceBlockHash(13)),
+            prefetch_inflight_hash: Some(ExternalSequenceBlockHash(13)),
+        };
+
+        let mut scores = OverlapScores::new();
+        scores.update_scores_at([(&worker, &cxl_only)], true, 0, LocalBlockHash(100));
+        scores.update_scores_at([(&worker, &cpu_and_cxl)], true, 1, LocalBlockHash(101));
+        scores.update_scores_at([(&worker, &gpu_and_cxl)], true, 2, LocalBlockHash(102));
+        scores.update_scores_at([(&worker, &cxl_and_inflight)], true, 3, LocalBlockHash(103));
+
+        let candidates: Vec<_> = scores
+            .block_residency
+            .get(&worker)
+            .unwrap()
+            .iter()
+            .filter(|metadata| metadata.cxl_only())
+            .map(|metadata| metadata.block_hash)
+            .collect();
+        assert_eq!(candidates, vec![LocalBlockHash(100)]);
+    }
+
     fn setup() {
         dynamo_runtime::logging::init();
     }
@@ -2446,6 +2715,7 @@ mod tests {
                 block_hash: ExternalSequenceBlockHash(*i * 100),
                 mm_extra_info: None,
                 medium: None,
+                ..Default::default()
             })
             .collect()
     }
@@ -2486,6 +2756,7 @@ mod tests {
                         .iter()
                         .map(|i| ExternalSequenceBlockHash(*i * 100))
                         .collect(),
+                    medium: None,
                 }),
                 dp_rank: 0,
             },
@@ -3260,6 +3531,7 @@ mod tests {
                     mm_extra_info: None,
                     tokens_hash: LocalBlockHash(13226331709069118873),
                     medium: None,
+                    ..Default::default()
                 }],
             }),
             dp_rank: 0,
@@ -3554,19 +3826,19 @@ mod tests {
             block_1
                 .borrow()
                 .workers
-                .contains(&WorkerWithDpRank::from_worker_id(worker_0))
+                .contains_key(&WorkerWithDpRank::from_worker_id(worker_0))
         );
         assert!(
             block_1
                 .borrow()
                 .workers
-                .contains(&WorkerWithDpRank::from_worker_id(worker_1))
+                .contains_key(&WorkerWithDpRank::from_worker_id(worker_1))
         );
         assert!(
             block_1
                 .borrow()
                 .workers
-                .contains(&WorkerWithDpRank::from_worker_id(worker_2))
+                .contains_key(&WorkerWithDpRank::from_worker_id(worker_2))
         );
 
         // Remove worker_0
@@ -3592,19 +3864,19 @@ mod tests {
             !block_1
                 .borrow()
                 .workers
-                .contains(&WorkerWithDpRank::from_worker_id(worker_0))
+                .contains_key(&WorkerWithDpRank::from_worker_id(worker_0))
         );
         assert!(
             block_1
                 .borrow()
                 .workers
-                .contains(&WorkerWithDpRank::from_worker_id(worker_1))
+                .contains_key(&WorkerWithDpRank::from_worker_id(worker_1))
         );
         assert!(
             block_1
                 .borrow()
                 .workers
-                .contains(&WorkerWithDpRank::from_worker_id(worker_2))
+                .contains_key(&WorkerWithDpRank::from_worker_id(worker_2))
         );
 
         // Verify that blocks with no remaining workers have their children cleared
@@ -3620,7 +3892,7 @@ mod tests {
             block_2
                 .borrow()
                 .workers
-                .contains(&WorkerWithDpRank::from_worker_id(worker_1))
+                .contains_key(&WorkerWithDpRank::from_worker_id(worker_1))
         );
 
         // Verify match results no longer include worker_0
@@ -3724,6 +3996,7 @@ mod tests {
                             tokens_hash: LocalBlockHash(id * 200),
                             mm_extra_info: None,
                             medium: None,
+                            ..Default::default()
                         }],
                     }),
                     dp_rank: 0,
@@ -3901,6 +4174,7 @@ mod tests {
                         tokens_hash: LocalBlockHash(200),
                         mm_extra_info: None,
                         medium: None,
+                        ..Default::default()
                     }],
                 }),
                 dp_rank: 0,

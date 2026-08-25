@@ -237,6 +237,9 @@ impl OpenAIPreprocessor {
         builder.output_options(request.extract_output_options()?);
         builder.annotations(request.annotations().unwrap_or_default());
         builder.mdc_sum(Some(self.mdcsum.clone()));
+        // Preserve backend-specific request metadata (notably LMCache's
+        // kv_transfer_params) all the way to the vLLM worker.
+        builder.extra_args(request.extra_args());
         // Extract routing hints from nvext if present
         if let Some(nvext) = request.nvext() {
             // Build routing hints from nvext fields
@@ -365,9 +368,20 @@ impl OpenAIPreprocessor {
             // Preserve original messages in extra_args for multimodal workers that need them
             // (e.g., TRT-LLM multimodal processor needs raw messages for proper tokenization)
             let messages_json = serde_json::to_value(request.messages())?;
-            let extra_args = serde_json::json!({
-                "messages": messages_json
-            });
+            let mut extra_args = request
+                .extra_args()
+                .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
+            if let Some(args) = extra_args.as_object_mut() {
+                args.insert("messages".to_string(), messages_json);
+            } else {
+                // Backend extra args are expected to be an object. Preserve
+                // the value rather than silently dropping it, while still
+                // making the multimodal messages available.
+                extra_args = serde_json::json!({
+                    "backend_extra_args": extra_args,
+                    "messages": messages_json,
+                });
+            }
             builder.extra_args(Some(extra_args));
         }
 

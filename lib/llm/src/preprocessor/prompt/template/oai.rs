@@ -208,6 +208,12 @@ impl OAIChatLikeRequest for NvCreateChatCompletionRequest {
         self.inner.model.clone()
     }
 
+    fn extra_args(&self) -> Option<serde_json::Value> {
+        self.kv_transfer_params
+            .as_ref()
+            .map(|params| serde_json::json!({"kv_transfer_params": params}))
+    }
+
     fn messages(&self) -> Value {
         let messages_json = serde_json::to_value(&self.inner.messages).unwrap();
         Value::from_serialize(&messages_json)
@@ -270,6 +276,12 @@ impl OAIChatLikeRequest for NvCreateChatCompletionRequest {
 impl OAIChatLikeRequest for NvCreateCompletionRequest {
     fn model(&self) -> String {
         self.inner.model.clone()
+    }
+
+    fn extra_args(&self) -> Option<serde_json::Value> {
+        self.kv_transfer_params
+            .as_ref()
+            .map(|params| serde_json::json!({"kv_transfer_params": params}))
     }
     fn messages(&self) -> minijinja::value::Value {
         let message = dynamo_async_openai::types::ChatCompletionRequestMessage::User(
@@ -1217,5 +1229,22 @@ NORMAL MODE
     fn add_when_empty() {
         let s = dummy_state(vec![]);
         assert!(s.should_add_generation_prompt());
+    }
+
+    #[test]
+    fn kv_transfer_params_are_exposed_as_backend_extra_args() {
+        let request: NvCreateChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "kv_transfer_params": {"lmcache.session_id": "session-42"}
+        }))
+        .unwrap();
+
+        assert_eq!(
+            request.extra_args(),
+            Some(serde_json::json!({
+                "kv_transfer_params": {"lmcache.session_id": "session-42"}
+            }))
+        );
     }
 }

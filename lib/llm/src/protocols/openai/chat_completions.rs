@@ -58,6 +58,14 @@ pub struct NvCreateChatCompletionRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub media_io_kwargs: Option<MediaDecoder>,
 
+    /// LMCache/vLLM KV-transfer metadata.
+    ///
+    /// This is intentionally modeled as an opaque JSON value: the frontend
+    /// must preserve provider-specific keys (for example
+    /// `lmcache.session_id`) while forwarding the request to the worker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kv_transfer_params: Option<serde_json::Value>,
+
     /// Catch-all for unsupported fields - checked during validation
     #[serde(flatten, default, skip_serializing)]
     pub unsupported_fields: std::collections::HashMap<String, serde_json::Value>,

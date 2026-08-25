@@ -429,6 +429,7 @@ async def init_prefill(
 
     generate_endpoint = component.endpoint(config.endpoint)
     clear_endpoint = component.endpoint("clear_kv_blocks")
+    cxl_prefetch_endpoint = component.endpoint("cxl_prefetch")
 
     (
         engine_client,
@@ -524,6 +525,10 @@ async def init_prefill(
                 handler.clear_kv_blocks,
                 metrics_labels=[("model", config.served_model_name)],
             ),
+            cxl_prefetch_endpoint.serve_endpoint(
+                handler.cxl_prefetch,
+                metrics_labels=[("model", config.served_model_name or config.model)],
+            ),
         )
         logger.debug("serve_endpoint completed for prefill worker")
     except Exception as e:
@@ -545,6 +550,7 @@ async def init(
 
     generate_endpoint = component.endpoint(config.endpoint)
     clear_endpoint = component.endpoint("clear_kv_blocks")
+    cxl_prefetch_endpoint = component.endpoint("cxl_prefetch")
     load_lora_endpoint = component.endpoint("load_lora")
     unload_lora_endpoint = component.endpoint("unload_lora")
     list_loras_endpoint = component.endpoint("list_loras")
@@ -658,6 +664,10 @@ async def init(
             ),
             clear_endpoint.serve_endpoint(
                 handler.clear_kv_blocks,
+                metrics_labels=[("model", config.served_model_name or config.model)],
+            ),
+            cxl_prefetch_endpoint.serve_endpoint(
+                handler.cxl_prefetch,
                 metrics_labels=[("model", config.served_model_name or config.model)],
             ),
             load_lora_endpoint.serve_endpoint(

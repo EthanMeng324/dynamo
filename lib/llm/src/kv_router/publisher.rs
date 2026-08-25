@@ -631,8 +631,11 @@ fn convert_event(
             // (vLLM, LMCache) are responsible for aligning their chunk
             // size with the router's kv_block_size; users configure both
             // explicitly via --kv-cache-block-size / --block-size.
-            let block_token_sizes = compute_block_token_sizes(num_blocks, block_size, token_ids_len);
-            for (block_idx, (original_hash_u64, original_hash_i64)) in original_hashes.iter().enumerate() {
+            let block_token_sizes =
+                compute_block_token_sizes(num_blocks, block_size, token_ids_len);
+            for (block_idx, (original_hash_u64, original_hash_i64)) in
+                original_hashes.iter().enumerate()
+            {
                 let this_block_tokens = *block_token_sizes.get(block_idx).unwrap_or(&0);
 
                 if this_block_tokens != kv_block_size as usize {
@@ -714,7 +717,9 @@ fn convert_event(
             }
         }
         RawKvEvent::BlockRemoved {
-            block_hashes, medium, ..
+            block_hashes,
+            medium,
+            ..
         } => {
             if medium.is_none() {
                 tracing::warn!(
@@ -747,7 +752,11 @@ fn convert_event(
     }
 }
 
-fn compute_block_token_sizes(num_blocks: usize, block_size: usize, token_ids_len: usize) -> Vec<usize> {
+fn compute_block_token_sizes(
+    num_blocks: usize,
+    block_size: usize,
+    token_ids_len: usize,
+) -> Vec<usize> {
     if num_blocks == 0 {
         return Vec::new();
     }
@@ -1274,7 +1283,8 @@ mod test_event_processing {
         let token_ids = vec![10, 20, 30, 40];
         let blk_hash = 0xdead_beef;
 
-        let stored = create_stored_block_from_parts(kv_block_size, blk_hash, &token_ids, 0, None, None);
+        let stored =
+            create_stored_block_from_parts(kv_block_size, blk_hash, &token_ids, 0, None, None);
 
         assert_eq!(stored.block_hash.0, blk_hash);
         let expected_hash = compute_block_hash_for_seq(&token_ids, 4, None)[0];
@@ -1351,13 +1361,7 @@ mod test_event_processing {
             block_mm_infos: None,
         };
 
-        let out = convert_event(
-            raw_evt,
-            42,
-            kv_block_size,
-            0,
-            &Arc::new(AtomicU32::new(0)),
-        );
+        let out = convert_event(raw_evt, 42, kv_block_size, 0, &Arc::new(AtomicU32::new(0)));
         assert!(matches!(out.data, KvCacheEventData::Stored(_)));
     }
 
@@ -1368,13 +1372,7 @@ mod test_event_processing {
             block_hashes: vec![BlockHashValue::Unsigned(123), BlockHashValue::Signed(456)],
             medium: None,
         };
-        let out = convert_event(
-            raw_evt,
-            7,
-            kv_block_size,
-            0,
-            &Arc::new(AtomicU32::new(0)),
-        );
+        let out = convert_event(raw_evt, 7, kv_block_size, 0, &Arc::new(AtomicU32::new(0)));
 
         assert!(matches!(out.data, KvCacheEventData::Removed(_)));
     }
@@ -1383,13 +1381,7 @@ mod test_event_processing {
     fn test_convert_event_all_blocks_cleared() {
         let kv_block_size = 4;
         let raw_evt = RawKvEvent::AllBlocksCleared;
-        let out = convert_event(
-            raw_evt,
-            1,
-            kv_block_size,
-            0,
-            &Arc::new(AtomicU32::new(0)),
-        );
+        let out = convert_event(raw_evt, 1, kv_block_size, 0, &Arc::new(AtomicU32::new(0)));
         assert!(matches!(out.data, KvCacheEventData::Cleared));
     }
 
@@ -1412,13 +1404,7 @@ mod test_event_processing {
             block_mm_infos: None,
         };
 
-        let out = convert_event(
-            raw_evt,
-            42,
-            kv_block_size,
-            0,
-            &warning_count,
-        );
+        let out = convert_event(raw_evt, 42, kv_block_size, 0, &warning_count);
         let KvCacheEventData::Stored(store) = out.data else {
             panic!("expected stored event");
         };
@@ -1443,13 +1429,7 @@ mod test_event_processing {
             block_mm_infos: None,
         };
 
-        let out = convert_event(
-            raw_evt,
-            7,
-            kv_block_size,
-            0,
-            &warning_count,
-        );
+        let out = convert_event(raw_evt, 7, kv_block_size, 0, &warning_count);
         let KvCacheEventData::Stored(store) = out.data else {
             panic!("expected stored event");
         };
@@ -1516,6 +1496,7 @@ mod tests_startup_helpers {
             event_id: 1,
             data: KvCacheEventData::Removed(KvCacheRemoveData {
                 block_hashes: vec![ExternalSequenceBlockHash(1), ExternalSequenceBlockHash(2)],
+                medium: None,
             }),
             dp_rank: 0,
         };
@@ -1560,11 +1541,13 @@ mod tests_startup_helpers {
                         block_hash: ExternalSequenceBlockHash(100),
                         tokens_hash: LocalBlockHash(200),
                         mm_extra_info: None,
+                        ..Default::default()
                     },
                     KvCacheStoredBlockData {
                         block_hash: ExternalSequenceBlockHash(101),
                         tokens_hash: LocalBlockHash(201),
                         mm_extra_info: None,
+                        ..Default::default()
                     },
                 ],
             }),
@@ -1650,6 +1633,7 @@ mod tests_startup_helpers {
                     block_hash: ExternalSequenceBlockHash(100),
                     tokens_hash: LocalBlockHash(200),
                     mm_extra_info: None,
+                    ..Default::default()
                 }],
             }),
             dp_rank: 0,
@@ -1672,6 +1656,7 @@ mod tests_startup_helpers {
             event_id: 2,
             data: KvCacheEventData::Removed(KvCacheRemoveData {
                 block_hashes: vec![ExternalSequenceBlockHash(100)],
+                medium: None,
             }),
             dp_rank: 0,
         };
@@ -1731,6 +1716,7 @@ mod tests_startup_helpers {
                     block_hash: ExternalSequenceBlockHash(100),
                     tokens_hash: LocalBlockHash(200),
                     mm_extra_info: None,
+                    ..Default::default()
                 }],
             }),
             dp_rank: 0,
@@ -1808,6 +1794,7 @@ mod tests_startup_helpers {
             event_id: 1,
             data: KvCacheEventData::Removed(KvCacheRemoveData {
                 block_hashes: vec![ExternalSequenceBlockHash(1)],
+                medium: None,
             }),
             dp_rank: 0,
         };
@@ -1968,11 +1955,13 @@ mod tests_startup_helpers {
                         block_hash: ExternalSequenceBlockHash(100),
                         tokens_hash: LocalBlockHash(200),
                         mm_extra_info: None,
+                        ..Default::default()
                     },
                     KvCacheStoredBlockData {
                         block_hash: ExternalSequenceBlockHash(101),
                         tokens_hash: LocalBlockHash(201),
                         mm_extra_info: None,
+                        ..Default::default()
                     },
                 ],
             }),
@@ -2034,11 +2023,13 @@ mod tests_startup_helpers {
                         block_hash: ExternalSequenceBlockHash(100), // Shared prefix
                         tokens_hash: LocalBlockHash(200),
                         mm_extra_info: None,
+                        ..Default::default()
                     },
                     KvCacheStoredBlockData {
                         block_hash: ExternalSequenceBlockHash(102), // New block
                         tokens_hash: LocalBlockHash(202),
                         mm_extra_info: None,
+                        ..Default::default()
                     },
                 ],
             }),

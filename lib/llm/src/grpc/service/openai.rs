@@ -315,6 +315,7 @@ impl TryFrom<inference::ModelInferRequest> for NvCreateCompletionRequest {
             common: Default::default(),
             nvext: None,
             metadata: None,
+            kv_transfer_params: None,
             unsupported_fields: Default::default(),
         })
     }
