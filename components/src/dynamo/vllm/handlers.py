@@ -45,6 +45,13 @@ DECODED_VARIANT_KEY: Final = "Decoded"
 configure_dynamo_logging()
 logger = logging.getLogger(__name__)
 
+_LMCACHE_CXL_PREFETCH_HINT = "lmcache.cxl_prefetch_hint"
+_MAX_FORWARDED_CXL_PREFETCH_CHUNKS = 64
+# ``max_chunks`` is a per-batch limit.  Keep candidate parsing bounded
+# independently so a small batch does not silently discard the rest of a
+# request's eligible CXL-only chunks.
+_MAX_FORWARDED_CXL_PREFETCH_CANDIDATES = 64
+
 
 def _positive_env_int(name: str, default: int, alias: str | None = None) -> int:
     """Read a positive integer setting without making endpoint startup fragile."""
@@ -239,6 +246,75 @@ def build_sampling_params_openai(
     return sampling_params
 
 
+def attach_cxl_prefetch_hint(
+    request: Dict[str, Any],
+    sampling_params: SamplingParams,
+) -> bool:
+    """Carry a router-generated CXL hint through vLLM request metadata.
+
+    The hint is deliberately nested in ``kv_transfer_params`` because that
+    metadata is already propagated to the scheduler-side LMCache connector.
+    The connector/lookup server consumes it before performing the normal
+    lookup, so no separate collective RPC is needed.
+    """
+    routing = request.get("routing")
+    if not isinstance(routing, dict):
+        return False
+    hint = routing.get("cxl_prefetch_hint")
+    if not isinstance(hint, dict):
+        return False
+
+    try:
+        max_chunks = min(
+            max(0, int(hint.get("max_chunks", 0))),
+            _MAX_FORWARDED_CXL_PREFETCH_CHUNKS,
+        )
+        raw_indices = hint.get("candidate_block_indices", [])
+        candidate_indices: list[int] = []
+        seen_indices: set[int] = set()
+        # Bound parsing itself, rather than constructing a set from an
+        # untrusted arbitrarily large list before slicing it.  This bound is
+        # independent of max_chunks because max_chunks limits each submission
+        # batch, not the complete request candidate set.
+        for raw_index in raw_indices:
+            index = max(0, int(raw_index))
+            if index in seen_indices:
+                continue
+            seen_indices.add(index)
+            candidate_indices.append(index)
+            if len(candidate_indices) >= _MAX_FORWARDED_CXL_PREFETCH_CANDIDATES:
+                break
+        candidate_indices.sort()
+    except (TypeError, ValueError):
+        logger.debug("Ignoring malformed CXL prefetch hint")
+        return False
+
+    if max_chunks <= 0 or not candidate_indices:
+        return False
+
+    forwarded_hint: dict[str, Any] = {
+        "candidate_block_indices": candidate_indices,
+        "max_chunks": max_chunks,
+    }
+    route_decided_unix_ns = hint.get("route_decided_unix_ns")
+    if route_decided_unix_ns is not None:
+        try:
+            forwarded_hint["route_decided_unix_ns"] = int(route_decided_unix_ns)
+        except (TypeError, ValueError):
+            pass
+
+    extra_args = dict(sampling_params.extra_args or {})
+    kv_transfer_params = extra_args.get("kv_transfer_params")
+    if not isinstance(kv_transfer_params, dict):
+        kv_transfer_params = {}
+    else:
+        kv_transfer_params = dict(kv_transfer_params)
+    kv_transfer_params[_LMCACHE_CXL_PREFETCH_HINT] = forwarded_hint
+    extra_args["kv_transfer_params"] = kv_transfer_params
+    sampling_params.extra_args = extra_args
+    return True
+
+
 class BaseWorkerHandler(ABC):
     """
     Request handler for the generate and clear_kv_blocks endpoints.
@@ -288,10 +364,10 @@ class BaseWorkerHandler(ABC):
         # Store shutdown event for graceful shutdown monitoring
         self.shutdown_event = shutdown_event
 
-        # Waiting-route CXL hints are deliberately admitted through a separate,
-        # bounded queue.  The endpoint only enqueues and returns; a single
-        # background consumer performs the vLLM collective RPC so a hint never
-        # occupies the request handler while waiting for EngineCore.
+        # Legacy standalone CXL hints are admitted through a separate, bounded
+        # queue. The main route-carried hint path does not use this queue; the
+        # endpoint only enqueues and returns, and a single background consumer
+        # performs the vLLM collective RPC.
         self._cxl_prefetch_queue: asyncio.Queue[
             tuple[str, list[int], int, int, list[int], str, dict[str, Any]]
         ] = (
@@ -459,7 +535,7 @@ class BaseWorkerHandler(ABC):
             )
 
     async def _run_cxl_prefetch_queue(self) -> None:
-        """Drain speculative hints independently from request endpoints."""
+        """Drain route-time hints independently from request endpoints."""
         while True:
             (
                 request_id,
@@ -519,17 +595,16 @@ class BaseWorkerHandler(ABC):
                     logger.info(
                         "CXL prefetch timeline worker_rpc_return "
                         "request_id=%s source=%s worker_rpc_return_unix_ns=%d "
-                        "scheduled=%d statuses=%s route_enqueued_unix_ns=%s "
-                        "lookahead_admitted_unix_ns=%s queue_depth=%s "
+                        "scheduled=%d statuses=%s route_decided_unix_ns=%s "
+                        "prefetch_admitted_unix_ns=%s "
                         "worker_received_unix_ns=%s",
                         request_id,
                         prefetch_kind,
                         worker_rpc_return_unix_ns,
                         scheduled,
                         statuses,
-                        trace.get("route_enqueued_unix_ns"),
-                        trace.get("lookahead_admitted_unix_ns"),
-                        trace.get("lookahead_queue_depth"),
+                        trace.get("route_decided_unix_ns"),
+                        trace.get("prefetch_admitted_unix_ns"),
                         trace.get("worker_received_unix_ns"),
                     )
                 message = (
@@ -590,15 +665,14 @@ class BaseWorkerHandler(ABC):
                 }
             )
             prefetch_kind = str(
-                request.get("prefetch_kind", "dynamo_queue_lookahead")
+                request.get("prefetch_kind", "dynamo_route_time")
             )
             worker_received_unix_ns = time.time_ns()
             trace = {
-                "route_enqueued_unix_ns": request.get("route_enqueued_unix_ns"),
-                "lookahead_admitted_unix_ns": request.get(
-                    "lookahead_admitted_unix_ns"
+                "route_decided_unix_ns": request.get("route_decided_unix_ns"),
+                "prefetch_admitted_unix_ns": request.get(
+                    "prefetch_admitted_unix_ns"
                 ),
-                "lookahead_queue_depth": request.get("lookahead_queue_depth"),
                 "worker_received_unix_ns": worker_received_unix_ns,
             }
 
@@ -632,14 +706,12 @@ class BaseWorkerHandler(ABC):
                 logger.info(
                     "CXL prefetch timeline worker_receive request_id=%s "
                     "source=%s worker_received_unix_ns=%d "
-                    "route_enqueued_unix_ns=%s lookahead_admitted_unix_ns=%s "
-                    "queue_depth=%s",
+                    "route_decided_unix_ns=%s prefetch_admitted_unix_ns=%s",
                     request_id,
                     prefetch_kind,
                     worker_received_unix_ns,
-                    trace["route_enqueued_unix_ns"],
-                    trace["lookahead_admitted_unix_ns"],
-                    trace["lookahead_queue_depth"],
+                    trace["route_decided_unix_ns"],
+                    trace["prefetch_admitted_unix_ns"],
                 )
             yield {
                 "status": "queued",
@@ -1542,10 +1614,18 @@ class DecodeWorkerHandler(BaseWorkerHandler):
         if kv_params is not None:
             if sampling_params.extra_args is None:
                 sampling_params.extra_args = {}
-            sampling_params.extra_args["kv_transfer_params"] = kv_params
+            existing_kv_params = sampling_params.extra_args.get("kv_transfer_params")
+            if not isinstance(existing_kv_params, dict):
+                existing_kv_params = {}
+            else:
+                existing_kv_params = dict(existing_kv_params)
+            existing_kv_params.update(kv_params)
+            sampling_params.extra_args["kv_transfer_params"] = existing_kv_params
             logger.debug(
                 f"Using disaggregated params from prefill for request {request_id}"
             )
+        if attach_cxl_prefetch_hint(request, sampling_params):
+            logger.debug("Attached route-time CXL prefetch hint to %s", request_id)
         prefill_prompt_tokens_details = (
             prefill_result.get("prompt_tokens_details") if prefill_result else None
         )
@@ -1612,6 +1692,8 @@ class DecodeWorkerHandler(BaseWorkerHandler):
         sampling_params = build_sampling_params_openai(
             request, self.default_sampling_params
         )
+        if attach_cxl_prefetch_hint(request, sampling_params):
+            logger.debug("Attached route-time CXL prefetch hint to %s", request_id)
 
         dp_rank = request.get("routing", {}).get("dp_rank")
         openai_request_id = request.get("id") or request.get("request_id", request_id)
@@ -1743,9 +1825,15 @@ class PrefillWorkerHandler(BaseWorkerHandler):
         # Configure for prefill-only mode with remote decode
         if sampling_params.extra_args is None:
             sampling_params.extra_args = {}
-        sampling_params.extra_args["kv_transfer_params"] = {
-            "do_remote_decode": True,
-        }
+        existing_kv_params = sampling_params.extra_args.get("kv_transfer_params")
+        if not isinstance(existing_kv_params, dict):
+            existing_kv_params = {}
+        else:
+            existing_kv_params = dict(existing_kv_params)
+        existing_kv_params["do_remote_decode"] = True
+        sampling_params.extra_args["kv_transfer_params"] = existing_kv_params
+        if attach_cxl_prefetch_hint(request, sampling_params):
+            logger.debug("Attached route-time CXL prefetch hint to %s", request_id)
         sampling_params_defaults = {
             "do_remote_prefill": False,
             "remote_engine_id": None,

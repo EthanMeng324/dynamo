@@ -250,6 +250,7 @@ impl OpenAIPreprocessor {
                 dp_rank: None, // dp_rank is set later in the pipeline
                 enable_local_updates: nvext.enable_local_updates,
                 expected_output_tokens: nvext.expected_output_tokens,
+                cxl_prefetch_hint: None,
             };
             builder.routing(Some(routing));
         }

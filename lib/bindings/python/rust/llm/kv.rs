@@ -1185,6 +1185,7 @@ impl KvPushRouter {
             let routing = llm_rs::protocols::common::preprocessor::RoutingHints {
                 backend_instance_id: worker_id,
                 dp_rank,
+                cxl_prefetch_hint: None,
                 ..Default::default()
             };
             request_builder.routing(Some(routing));

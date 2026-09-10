@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Best-effort waiting-route CXL prefetch requests.
+//! Best-effort route-time CXL prefetch requests.
 
 use std::{
     collections::{HashMap, HashSet},
     env,
     sync::{Arc, Mutex, Once},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result};
@@ -18,23 +18,25 @@ use serde_json::{Value, json};
 use tokio::sync::{OnceCell, mpsc};
 use tokio_stream::StreamExt;
 
+use super::indexer::{BlockResidencyMetadata, OverlapScores};
 use super::protocols::{LocalBlockHash, WorkerWithDpRank};
+use crate::protocols::common::preprocessor::CxlPrefetchHint;
 
 const PREFETCH_ENDPOINT: &str = "cxl_prefetch";
 const BACKEND_COMPONENT: &str = "backend";
 /// The indexer retains at most this many per-block residency entries.  Keep
 /// the token scan bounded by the same order of magnitude when a sparse CXL
 /// block appears late in the matched prefix.
-const MAX_LOOKAHEAD_SCAN_CHUNKS: usize = 64;
+const MAX_PREFETCH_SCAN_CHUNKS: usize = 64;
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum PrefetchSource {
-    DynamoQueueLookahead,
+    DynamoRouteTime,
 }
 
 impl PrefetchSource {
     fn as_str(self) -> &'static str {
         match self {
-            Self::DynamoQueueLookahead => "dynamo_queue_lookahead",
+            Self::DynamoRouteTime => "dynamo_route_time",
         }
     }
 }
@@ -43,58 +45,69 @@ impl PrefetchSource {
 /// can be joined without relying on log ordering. Values are Unix nanoseconds.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct PrefetchTrace {
-    pub route_enqueued_unix_ns: Option<u128>,
-    pub lookahead_admitted_unix_ns: Option<u128>,
-    pub queue_depth: Option<usize>,
+    pub route_decided_unix_ns: Option<u128>,
+    pub prefetch_admitted_unix_ns: Option<u128>,
 }
 
 #[derive(Debug, Clone)]
 struct CxlPrefetchConfig {
-    lookahead_enabled: bool,
+    enabled: bool,
     min_tokens: usize,
+    /// Maximum number of chunks sent to LMCache in one worker-side admission
+    /// batch.  This is not a per-request candidate limit.
     max_chunks: usize,
     /// LMCache's logical chunk size.  This is intentionally independent of the router's block size: the worker, not Dynamo, turns token IDs into CacheEngineKeys.
     chunk_size: usize,
     rpc_timeout: Duration,
     queue_capacity: usize,
-    /// Number of requests to inspect behind the request currently being routed. Zero keeps the queue-lookahead path disabled.
-    lookahead_window: usize,
-    /// How long a `(worker, block)` lookahead reservation suppresses another hint. This is a safety TTL, not a residency guarantee.
-    lookahead_reservation_ttl: Duration,
-    /// Bound router-local lookahead metadata under repeated-prefix load.
-    lookahead_reservation_capacity: usize,
+    /// How long a `(worker, block)` reservation suppresses another hint. This
+    /// is a safety TTL, not a residency guarantee.
+    reservation_ttl: Duration,
+    /// Bound router-local reservation metadata under repeated-prefix load.
+    reservation_capacity: usize,
     /// Highest block position that a hint may inspect.  The worker must hash the preceding chunks to derive a prefix key, but it only promotes the explicitly selected candidate indices.
     max_scan_chunks: usize,
 }
 
 impl CxlPrefetchConfig {
     fn from_env() -> Self {
-        let lookahead_enabled = env_bool("DYN_CXL_PREFETCH_LOOKAHEAD_ENABLED", false);
+        // The old LOOKAHEAD_ENABLED name is accepted as a compatibility alias,
+        // but there is no longer a lookahead window.  Prefetch is evaluated for
+        // the request at the time its route is selected.
+        let enabled = env_bool(
+            "DYN_CXL_PREFETCH_ENABLED",
+            env_bool("DYN_CXL_PREFETCH_LOOKAHEAD_ENABLED", false),
+        );
         Self {
-            lookahead_enabled,
+            enabled,
             min_tokens: env_usize("DYN_CXL_PREFETCH_MIN_TOKENS", 256),
-            max_chunks: env_usize("DYN_CXL_PREFETCH_MAX_CHUNKS", 8).max(1),
+            max_chunks: env_usize(
+                "DYN_CXL_PREFETCH_BATCH_CHUNKS",
+                env_usize("DYN_CXL_PREFETCH_MAX_CHUNKS", 8),
+            )
+            .max(1),
             chunk_size: env_usize("DYN_CXL_PREFETCH_CHUNK_SIZE", 256).max(1),
             rpc_timeout: Duration::from_millis(
                 env_u64("DYN_CXL_PREFETCH_RPC_TIMEOUT_MS", 10).max(1),
             ),
             queue_capacity: env_usize("DYN_CXL_PREFETCH_QUEUE_CAPACITY", 16).max(1),
-            // Keep the lookahead bounded even if a deployment supplies an
-            // excessively large value.
-            lookahead_window: env_usize("DYN_CXL_PREFETCH_LOOKAHEAD_WINDOW", 0).min(16),
-            lookahead_reservation_ttl: Duration::from_millis(
-                env_u64("DYN_CXL_PREFETCH_LOOKAHEAD_RESERVATION_TTL_MS", 5_000).clamp(1, 60_000),
+            reservation_ttl: Duration::from_millis(
+                env_u64(
+                    "DYN_CXL_PREFETCH_RESERVATION_TTL_MS",
+                    env_u64("DYN_CXL_PREFETCH_LOOKAHEAD_RESERVATION_TTL_MS", 5_000),
+                )
+                .clamp(1, 60_000),
             ),
-            lookahead_reservation_capacity: env_usize(
-                "DYN_CXL_PREFETCH_LOOKAHEAD_RESERVATION_CAPACITY",
-                16_384,
+            reservation_capacity: env_usize(
+                "DYN_CXL_PREFETCH_RESERVATION_CAPACITY",
+                env_usize("DYN_CXL_PREFETCH_LOOKAHEAD_RESERVATION_CAPACITY", 16_384),
             )
             .clamp(1, 1_000_000),
             max_scan_chunks: env_usize(
                 "DYN_CXL_PREFETCH_MAX_SCAN_CHUNKS",
-                MAX_LOOKAHEAD_SCAN_CHUNKS,
+                MAX_PREFETCH_SCAN_CHUNKS,
             )
-            .clamp(1, MAX_LOOKAHEAD_SCAN_CHUNKS),
+            .clamp(1, MAX_PREFETCH_SCAN_CHUNKS),
         }
     }
 }
@@ -118,6 +131,13 @@ fn env_u64(name: &str, default: u64) -> u64 {
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(default)
+}
+
+fn unix_time_ns() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
 }
 
 fn hint_token_limit(max_chunks: usize, chunk_size: usize) -> usize {
@@ -150,6 +170,29 @@ fn candidate_token_limit(
     Some(hint_token_limit(scan_chunks, chunk_size))
 }
 
+/// Return exact blocks that are currently CXL-only on the selected worker.
+///
+/// Aggregate overlap counters cannot distinguish a CXL block from one that is
+/// already available in the worker's CPU/GPU cache. Route-time dispatch uses
+/// this bounded per-block view so a hint is emitted only when it can perform a
+/// useful CXL-to-CPU promotion.
+pub(crate) fn cxl_only_prefetch_metadata(
+    overlaps: &OverlapScores,
+    worker: WorkerWithDpRank,
+    max_candidates: usize,
+    max_scan_chunks: usize,
+) -> Vec<BlockResidencyMetadata> {
+    overlaps
+        .block_residency
+        .get(&worker)
+        .into_iter()
+        .flatten()
+        .filter(|metadata| (metadata.block_index as usize) < max_scan_chunks && metadata.cxl_only())
+        .take(max_candidates)
+        .cloned()
+        .collect()
+}
+
 type PrefetchRouter = PushRouter<Value, Annotated<Value>>;
 
 /// Wait until discovery has made the selected worker available to the
@@ -180,7 +223,7 @@ struct PrefetchState {
     component: Component,
     config: CxlPrefetchConfig,
     router: OnceCell<Arc<PrefetchRouter>>,
-    lookahead_reservations: Mutex<LookaheadReservationTable>,
+    reservations: Mutex<RouteReservationTable>,
 }
 
 /// Router-local record of speculative work that has already been admitted.
@@ -189,13 +232,13 @@ struct PrefetchState {
 /// control-plane race where another request reaches Dynamo before the first
 /// worker RPC has emitted a CPU residency event.
 #[derive(Debug)]
-struct LookaheadReservationTable {
+struct RouteReservationTable {
     entries: HashMap<(WorkerWithDpRank, LocalBlockHash), Instant>,
     ttl: Duration,
     capacity: usize,
 }
 
-impl LookaheadReservationTable {
+impl RouteReservationTable {
     fn new(ttl: Duration, capacity: usize) -> Self {
         Self {
             entries: HashMap::new(),
@@ -260,21 +303,21 @@ pub(crate) struct CxlPrefetchClient {
 }
 
 impl PrefetchState {
-    fn reserve_lookahead(
+    fn reserve(
         &self,
         worker: WorkerWithDpRank,
         block_hashes: &[LocalBlockHash],
     ) -> Vec<LocalBlockHash> {
-        self.lookahead_reservations
+        self.reservations
             .lock()
-            .expect("waiting-route prefetch reservation mutex poisoned")
+            .expect("route-time prefetch reservation mutex poisoned")
             .reserve(worker, block_hashes)
     }
 
-    fn release_lookahead(&self, worker: WorkerWithDpRank, block_hashes: &[LocalBlockHash]) {
-        self.lookahead_reservations
+    fn release(&self, worker: WorkerWithDpRank, block_hashes: &[LocalBlockHash]) {
+        self.reservations
             .lock()
-            .expect("waiting-route prefetch reservation mutex poisoned")
+            .expect("route-time prefetch reservation mutex poisoned")
             .release(worker, block_hashes);
     }
 
@@ -311,9 +354,8 @@ impl PrefetchState {
             "max_chunks": self.config.max_chunks,
             "candidate_block_indices": candidate_block_indices,
             "prefetch_kind": source.as_str(),
-            "route_enqueued_unix_ns": trace.route_enqueued_unix_ns,
-            "lookahead_admitted_unix_ns": trace.lookahead_admitted_unix_ns,
-            "lookahead_queue_depth": trace.queue_depth,
+            "route_decided_unix_ns": trace.route_decided_unix_ns,
+            "prefetch_admitted_unix_ns": trace.prefetch_admitted_unix_ns,
         });
 
         let mut stream = router
@@ -363,40 +405,33 @@ impl CxlPrefetchClient {
         let worker_component = router_component
             .namespace()
             .component(BACKEND_COMPONENT)
-            .context("failed to create backend component for waiting-route CXL prefetch")?;
+            .context("failed to create backend component for route-time CXL prefetch")?;
         let config = CxlPrefetchConfig::from_env();
-        if config.lookahead_enabled {
+        if config.enabled {
             tracing::info!(
-                lookahead_enabled = config.lookahead_enabled,
+                enabled = config.enabled,
                 min_tokens = config.min_tokens,
                 max_chunks = config.max_chunks,
                 chunk_size = config.chunk_size,
                 rpc_timeout_ms = config.rpc_timeout.as_millis(),
                 queue_capacity = config.queue_capacity,
-                lookahead_window = config.lookahead_window,
-                lookahead_reservation_ttl_ms = config.lookahead_reservation_ttl.as_millis(),
-                lookahead_reservation_capacity = config.lookahead_reservation_capacity,
+                reservation_ttl_ms = config.reservation_ttl.as_millis(),
+                reservation_capacity = config.reservation_capacity,
                 endpoint = PREFETCH_ENDPOINT,
-                "CXL prefetch client enabled"
-            );
-        }
-        if config.lookahead_enabled && config.lookahead_window > 0 {
-            tracing::info!(
-                lookahead_window = config.lookahead_window,
-                "Dynamo waiting-route CXL prefetch lookahead enabled"
+                "Route-time CXL prefetch client enabled"
             );
         }
 
         let queue_capacity = config.queue_capacity;
-        let reservation_ttl = config.lookahead_reservation_ttl;
-        let reservation_capacity = config.lookahead_reservation_capacity;
+        let reservation_ttl = config.reservation_ttl;
+        let reservation_capacity = config.reservation_capacity;
         let (queue_tx, queue_rx) = mpsc::channel(queue_capacity);
         Ok(Self {
             state: Arc::new(PrefetchState {
                 component: worker_component,
                 config,
                 router: OnceCell::const_new(),
-                lookahead_reservations: Mutex::new(LookaheadReservationTable::new(
+                reservations: Mutex::new(RouteReservationTable::new(
                     reservation_ttl,
                     reservation_capacity,
                 )),
@@ -411,16 +446,8 @@ impl CxlPrefetchClient {
         self.state.config.chunk_size
     }
 
-    pub(crate) fn lookahead_enabled(&self) -> bool {
-        self.state.config.lookahead_enabled && self.state.config.lookahead_window > 0
-    }
-
-    pub(crate) fn lookahead_window(&self) -> usize {
-        if self.state.config.lookahead_enabled {
-            self.state.config.lookahead_window
-        } else {
-            0
-        }
+    pub(crate) fn enabled(&self) -> bool {
+        self.state.config.enabled
     }
 
     pub(crate) fn max_chunks(&self) -> usize {
@@ -432,7 +459,7 @@ impl CxlPrefetchClient {
     }
 
     fn should_prefetch(&self, token_count: usize) -> bool {
-        self.lookahead_enabled() && token_count >= self.state.config.min_tokens
+        self.enabled() && token_count >= self.state.config.min_tokens
     }
 
     /// Copy the shortest prefix needed to derive the sparse candidate keys.
@@ -459,14 +486,52 @@ impl CxlPrefetchClient {
         Some(token_ids.iter().copied().take(token_limit).collect())
     }
 
+    /// Build the request-carried form of a route-time hint.
+    ///
+    /// The old endpoint transport used `prepare_tokens` to trim the payload
+    /// before an asynchronous RPC.  The request envelope already carries the
+    /// prompt, so retain the same admission checks but let the worker derive
+    /// keys from its authoritative lookup token stream.
+    pub(crate) fn build_request_hint(
+        &self,
+        token_ids: &[u32],
+        candidate_block_indices: &[u32],
+        route_decided_unix_ns: u64,
+    ) -> Option<CxlPrefetchHint> {
+        if !self.should_prefetch(token_ids.len()) || candidate_block_indices.is_empty() {
+            return None;
+        }
+
+        let token_limit = candidate_token_limit(
+            candidate_block_indices,
+            self.state.config.chunk_size,
+            self.state.config.max_scan_chunks,
+        )?;
+        if token_ids.len() < token_limit {
+            return None;
+        }
+
+        Some(CxlPrefetchHint {
+            candidate_block_indices: candidate_block_indices
+                .iter()
+                .copied()
+                // Keep all eligible candidates in the bounded scan range.
+                // ``max_chunks`` is the worker-side per-batch limit.
+                .take(self.max_scan_chunks())
+                .collect(),
+            max_chunks: self.max_chunks().min(u32::MAX as usize) as u32,
+            route_decided_unix_ns: Some(route_decided_unix_ns),
+        })
+    }
+
     fn start_queue_worker(&self) {
         self.queue_worker_started.call_once(|| {
             let mut queue_rx = self
                 .queue_rx
                 .lock()
-                .expect("waiting-route prefetch queue mutex poisoned")
+                .expect("route-time prefetch queue mutex poisoned")
                 .take()
-                .expect("waiting-route prefetch queue worker started twice");
+                .expect("route-time prefetch queue worker started twice");
             let state = Arc::clone(&self.state);
 
             tokio::spawn(async move {
@@ -497,9 +562,9 @@ impl CxlPrefetchClient {
                     if !succeeded {
                         // A failed/timeout RPC never established a worker-side
                         // request, so make these blocks eligible for a later
-                        // waiting request immediately instead of waiting for
-                        // the normal reservation TTL.
-                        state.release_lookahead(worker, &reserved_blocks);
+                        // route immediately instead of waiting for the normal
+                        // reservation TTL.
+                        state.release(worker, &reserved_blocks);
                     }
                     match result {
                         Ok(Ok(())) => tracing::debug!(
@@ -558,10 +623,10 @@ impl CxlPrefetchClient {
         }
     }
 
-    /// Enqueue a hint for a request that is still waiting in Dynamo's route
-    /// scheduler. The request has not been handed to the worker yet, but its
-    /// token prefix and predicted worker are already known by the scheduler.
-    pub(crate) fn dispatch_lookahead(
+    /// Enqueue a hint for the worker selected for the current route. The
+    /// caller has already checked the selected worker's exact CXL-only block
+    /// metadata; this method only performs bounded admission and dispatch.
+    pub(crate) fn dispatch_route(
         &self,
         request_id: String,
         token_ids: Vec<u32>,
@@ -570,7 +635,7 @@ impl CxlPrefetchClient {
         candidate_block_indices: Vec<u32>,
         trace: PrefetchTrace,
     ) -> bool {
-        if !self.lookahead_enabled() {
+        if !self.enabled() {
             return false;
         }
 
@@ -581,21 +646,20 @@ impl CxlPrefetchClient {
         let candidate_pairs: Vec<(LocalBlockHash, u32)> = candidate_blocks
             .into_iter()
             .zip(candidate_block_indices)
-            .take(self.max_chunks())
             .collect();
         if candidate_pairs.is_empty() {
             return false;
         }
         let candidate_hashes: Vec<LocalBlockHash> =
             candidate_pairs.iter().map(|(hash, _)| *hash).collect();
-        let reserved_blocks = self.state.reserve_lookahead(worker, &candidate_hashes);
+        let reserved_blocks = self.state.reserve(worker, &candidate_hashes);
         if reserved_blocks.is_empty() {
             tracing::debug!(
                 request_id = %request_id,
                 worker_id = worker.worker_id,
                 dp_rank = worker.dp_rank,
                 candidate_blocks = candidate_block_count,
-                "Skipping waiting-route CXL hint because all candidate blocks are already reserved"
+                "Skipping route-time CXL hint because all candidate blocks are already reserved"
             );
             return false;
         }
@@ -609,17 +673,21 @@ impl CxlPrefetchClient {
             .filter_map(|(hash, index)| reserved_set.contains(hash).then_some(*index))
             .collect();
 
-        let admitted = self.enqueue(PrefetchJob {
-            request_id: request_id.clone(),
-            token_ids,
-            worker,
-            source: PrefetchSource::DynamoQueueLookahead,
-            trace,
-            reserved_blocks: reserved_blocks.clone(),
-            candidate_block_indices: reserved_indices,
-        });
+        let mut trace = trace;
+        let admitted = {
+            trace.prefetch_admitted_unix_ns = Some(unix_time_ns());
+            self.enqueue(PrefetchJob {
+                request_id: request_id.clone(),
+                token_ids,
+                worker,
+                source: PrefetchSource::DynamoRouteTime,
+                trace,
+                reserved_blocks: reserved_blocks.clone(),
+                candidate_block_indices: reserved_indices,
+            })
+        };
         if !admitted {
-            self.state.release_lookahead(worker, &reserved_blocks);
+            self.state.release(worker, &reserved_blocks);
         }
         admitted
     }
@@ -628,9 +696,10 @@ impl CxlPrefetchClient {
 #[cfg(test)]
 mod tests {
     use super::{
-        CxlPrefetchClient, CxlPrefetchConfig, LookaheadReservationTable, MAX_LOOKAHEAD_SCAN_CHUNKS,
-        candidate_token_limit, hint_token_limit,
+        CxlPrefetchClient, CxlPrefetchConfig, MAX_PREFETCH_SCAN_CHUNKS, RouteReservationTable,
+        candidate_token_limit, cxl_only_prefetch_metadata, hint_token_limit,
     };
+    use crate::kv_router::indexer::{BlockResidencyMetadata, OverlapScores};
     use crate::kv_router::protocols::{LocalBlockHash, WorkerWithDpRank};
     use dynamo_runtime::{DistributedRuntime, Runtime, distributed::DistributedConfig};
 
@@ -639,16 +708,15 @@ mod tests {
         // Avoid mutating process-wide environment in the unit test.  The
         // production defaults are exercised through the config constructor.
         let config = CxlPrefetchConfig {
-            lookahead_enabled: false,
+            enabled: false,
             min_tokens: 256,
             max_chunks: 8,
             chunk_size: 256,
             rpc_timeout: std::time::Duration::from_millis(10),
             queue_capacity: 16,
-            lookahead_window: 0,
-            lookahead_reservation_ttl: std::time::Duration::from_secs(5),
-            lookahead_reservation_capacity: 16_384,
-            max_scan_chunks: MAX_LOOKAHEAD_SCAN_CHUNKS,
+            reservation_ttl: std::time::Duration::from_secs(5),
+            reservation_capacity: 16_384,
+            max_scan_chunks: MAX_PREFETCH_SCAN_CHUNKS,
         };
         assert!(config.max_chunks > 0);
         assert!(config.chunk_size > 0);
@@ -657,13 +725,13 @@ mod tests {
     }
 
     #[test]
-    fn hint_window_uses_lmcache_chunk_size() {
+    fn hint_prefix_uses_lmcache_chunk_size() {
         let token_count = 2 * 256 + 63;
         let token_limit = hint_token_limit(2, 256);
 
         assert_eq!(token_limit, 512);
         assert!(token_count >= token_limit);
-        // A router block size of 64 must not reduce this window to 128.
+        // A router block size of 64 must not reduce this prefix to 128.
         assert_ne!(token_limit, 2 * 64);
     }
 
@@ -676,10 +744,93 @@ mod tests {
     }
 
     #[test]
-    fn lookahead_reservations_deduplicate_per_worker_and_release() {
+    fn cxl_only_candidates_exclude_local_and_inflight_blocks() {
+        let worker = WorkerWithDpRank::from_worker_id(3);
+        let mut overlaps = OverlapScores::new();
+        overlaps.block_residency.insert(
+            worker,
+            vec![
+                BlockResidencyMetadata {
+                    block_index: 0,
+                    block_hash: LocalBlockHash(10),
+                    gpu: false,
+                    cpu: true,
+                    cxl: true,
+                    prefetch_inflight: false,
+                },
+                BlockResidencyMetadata {
+                    block_index: 1,
+                    block_hash: LocalBlockHash(11),
+                    gpu: false,
+                    cpu: false,
+                    cxl: true,
+                    prefetch_inflight: false,
+                },
+                BlockResidencyMetadata {
+                    block_index: 2,
+                    block_hash: LocalBlockHash(12),
+                    gpu: false,
+                    cpu: false,
+                    cxl: true,
+                    prefetch_inflight: true,
+                },
+            ],
+        );
+
+        let candidates = cxl_only_prefetch_metadata(&overlaps, worker, 8, 3);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].block_hash, LocalBlockHash(11));
+    }
+
+    #[test]
+    fn cxl_only_candidates_keep_sparse_blocks_inside_scan_bound() {
+        let worker = WorkerWithDpRank::from_worker_id(4);
+        let mut overlaps = OverlapScores::new();
+        overlaps.block_residency.insert(
+            worker,
+            vec![
+                BlockResidencyMetadata {
+                    block_index: 1,
+                    block_hash: LocalBlockHash(21),
+                    gpu: false,
+                    cpu: false,
+                    cxl: true,
+                    prefetch_inflight: false,
+                },
+                BlockResidencyMetadata {
+                    block_index: 3,
+                    block_hash: LocalBlockHash(23),
+                    gpu: false,
+                    cpu: false,
+                    cxl: true,
+                    prefetch_inflight: false,
+                },
+                BlockResidencyMetadata {
+                    block_index: 4,
+                    block_hash: LocalBlockHash(24),
+                    gpu: false,
+                    cpu: false,
+                    cxl: true,
+                    prefetch_inflight: false,
+                },
+            ],
+        );
+
+        let candidates = cxl_only_prefetch_metadata(&overlaps, worker, 2, 4);
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|metadata| metadata.block_hash)
+                .collect::<Vec<_>>(),
+            vec![LocalBlockHash(21), LocalBlockHash(23)]
+        );
+    }
+
+    #[test]
+    fn route_reservations_deduplicate_per_worker_and_release() {
         let worker0 = WorkerWithDpRank::from_worker_id(10);
         let worker1 = WorkerWithDpRank::from_worker_id(11);
-        let mut table = LookaheadReservationTable::new(std::time::Duration::from_secs(5), 3);
+        let mut table = RouteReservationTable::new(std::time::Duration::from_secs(5), 3);
 
         assert_eq!(
             table.reserve(worker0, &[LocalBlockHash(1), LocalBlockHash(2)]),
@@ -711,7 +862,7 @@ mod tests {
         let drt = DistributedRuntime::new(runtime.clone(), DistributedConfig::process_local())
             .await
             .unwrap();
-        let namespace = drt.namespace("waiting-route-prefetch-test").unwrap();
+        let namespace = drt.namespace("route-prefetch-test").unwrap();
         let router_component = namespace.component("kv-router").unwrap();
 
         let client = CxlPrefetchClient::new(router_component).unwrap();
@@ -719,7 +870,7 @@ mod tests {
         assert_eq!(client.state.component.name(), "backend");
         assert_eq!(
             client.state.component.namespace().name(),
-            "waiting-route-prefetch-test"
+            "route-prefetch-test"
         );
 
         runtime.shutdown();

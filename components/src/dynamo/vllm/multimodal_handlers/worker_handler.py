@@ -290,10 +290,14 @@ class MultimodalPDWorkerHandler(BaseWorkerHandler):
         pd_request = copy.deepcopy(request)
         # Do prefill and remote decode if enable_disagg is true
         if self.enable_disagg and self.decode_worker_client:
-            extra_args = pd_request.sampling_params.extra_args or {}
-            extra_args["kv_transfer_params"] = {
-                "do_remote_decode": True,
-            }
+            extra_args = dict(pd_request.sampling_params.extra_args or {})
+            kv_transfer_params = extra_args.get("kv_transfer_params")
+            if not isinstance(kv_transfer_params, dict):
+                kv_transfer_params = {}
+            else:
+                kv_transfer_params = dict(kv_transfer_params)
+            kv_transfer_params["do_remote_decode"] = True
+            extra_args["kv_transfer_params"] = kv_transfer_params
             pd_request.sampling_params.extra_args = extra_args
             pd_request.sampling_params.max_tokens = 1
             pd_request.sampling_params.min_tokens = 1
@@ -326,8 +330,20 @@ class MultimodalPDWorkerHandler(BaseWorkerHandler):
                 logger.debug(
                     f"Prefill response kv_transfer_params: {prefill_response.kv_transfer_params}"
                 )
-                extra_args = decode_request.sampling_params.extra_args or {}
-                extra_args["kv_transfer_params"] = prefill_response.kv_transfer_params
+                extra_args = dict(decode_request.sampling_params.extra_args or {})
+                kv_transfer_params = prefill_response.kv_transfer_params
+                if not isinstance(kv_transfer_params, dict):
+                    kv_transfer_params = {}
+                else:
+                    kv_transfer_params = dict(kv_transfer_params)
+                original_kv_params = extra_args.get("kv_transfer_params")
+                if isinstance(original_kv_params, dict):
+                    route_hint = original_kv_params.get(
+                        "lmcache.cxl_prefetch_hint"
+                    )
+                    if route_hint is not None:
+                        kv_transfer_params["lmcache.cxl_prefetch_hint"] = route_hint
+                extra_args["kv_transfer_params"] = kv_transfer_params
                 extra_args.pop("serialized_request", None)
                 decode_request.sampling_params.extra_args = extra_args
                 logger.debug("Decode request: %s", decode_request)

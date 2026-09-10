@@ -7,7 +7,7 @@ use std::sync::{
     Arc, Mutex,
     atomic::{AtomicU64, Ordering},
 };
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use derive_builder::Builder;
@@ -48,7 +48,7 @@ use global_prefetch::{
 };
 use indexer::WorkerKvQueryResponse;
 use offload::BackgroundOffloadPlanner;
-use prefetch::CxlPrefetchClient;
+use prefetch::{CxlPrefetchClient, PrefetchTrace, cxl_only_prefetch_metadata};
 use prefetch_hint::PrefetchHintDispatcher;
 pub use prefill_router::PrefillRouter;
 use worker_query::WorkerQueryClient;
@@ -71,6 +71,7 @@ use crate::{
     model_card::ModelDeploymentCard,
     preprocessor::PreprocessedRequest,
     protocols::common::llm_backend::LLMEngineOutput,
+    protocols::common::preprocessor::CxlPrefetchHint,
     protocols::common::timing::RequestPhase,
 };
 
@@ -209,8 +210,12 @@ pub struct KvRouterConfig {
     pub background_offload_dry_run: bool,
     pub offload_interval_ms: u64,
     pub offload_window_ms: u64,
+    /// Minimum recent request count used by the locality-skew selector.
     pub offload_hot_request_threshold: u32,
+    /// Legacy threshold retained for the separate lower-load routing override.
     pub offload_owner_load_threshold: u64,
+    /// Compatibility name retained for the maximum offloads dispatched per
+    /// planner round. The planner also accepts DYN_BACKGROUND_OFFLOAD_MAX_PER_ROUND.
     pub offload_top_k: usize,
     pub offload_max_chunks: usize,
     pub offload_max_inflight: usize,
@@ -242,10 +247,10 @@ impl Default for KvRouterConfig {
             background_offload_dry_run: true,
             offload_interval_ms: 5_000,
             offload_window_ms: 10_000,
-            offload_hot_request_threshold: 5,
+            offload_hot_request_threshold: 3,
             offload_owner_load_threshold: 10,
-            offload_top_k: 100,
-            offload_max_chunks: 8,
+            offload_top_k: 2,
+            offload_max_chunks: 16,
             offload_max_inflight: 2,
             offload_cooldown_secs: 30,
         }
@@ -482,11 +487,10 @@ impl KvRouter {
         }
         let component = endpoint.component();
         let cxl_prefetch_client = Arc::new(CxlPrefetchClient::new(component.clone())?);
-        if cxl_prefetch_client.lookahead_enabled()
-            && cxl_prefetch_client.chunk_size() != block_size as usize
+        if cxl_prefetch_client.enabled() && cxl_prefetch_client.chunk_size() != block_size as usize
         {
             anyhow::bail!(
-                "waiting-route CXL prefetch requires Dynamo block_size == LMCache chunk_size; \
+                "route-time CXL prefetch requires Dynamo block_size == LMCache chunk_size; \
                  router block_size={} DYN_CXL_PREFETCH_CHUNK_SIZE={}",
                 block_size,
                 cxl_prefetch_client.chunk_size(),
@@ -547,7 +551,6 @@ impl KvRouter {
             block_size,
             workers_with_configs.clone(),
             selector,
-            Arc::clone(&cxl_prefetch_client),
             kv_router_config.router_replica_sync,
             router_id,
         )
@@ -677,6 +680,13 @@ impl KvRouter {
         }
     }
 
+    fn unix_time_ns() -> u128 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    }
+
     fn issue_prefetch_for_route(
         &self,
         request_id: &str,
@@ -788,6 +798,142 @@ impl KvRouter {
         }
     }
 
+    /// Check the exact residency of the worker selected for this route and
+    /// enqueue a bounded CXL-to-CPU hint for any useful CXL-only blocks.
+    ///
+    /// This is intentionally called after the authoritative routing choice,
+    /// so the hint follows the same worker decision as the request. The
+    /// asynchronous client keeps the route path non-blocking and the worker
+    /// remains the final authority on current CXL/CPU residency.
+    fn issue_cxl_prefetch_for_route(
+        &self,
+        request_id: &str,
+        tokens: &[u32],
+        worker: WorkerWithDpRank,
+        overlaps: &OverlapScores,
+    ) {
+        if !self.cxl_prefetch_client.enabled() || tokens.is_empty() {
+            return;
+        }
+
+        let candidate_metadata = cxl_only_prefetch_metadata(
+            overlaps,
+            worker,
+            self.cxl_prefetch_client.max_scan_chunks(),
+            self.cxl_prefetch_client.max_scan_chunks(),
+        );
+        if candidate_metadata.is_empty() {
+            tracing::debug!(
+                request_id,
+                worker_id = worker.worker_id,
+                dp_rank = worker.dp_rank,
+                "No CXL-only blocks available for route-time prefetch"
+            );
+            return;
+        }
+
+        let candidate_blocks: Vec<LocalBlockHash> = candidate_metadata
+            .iter()
+            .map(|metadata| metadata.block_hash)
+            .collect();
+        let candidate_block_indices: Vec<u32> = candidate_metadata
+            .iter()
+            .map(|metadata| metadata.block_index)
+            .collect();
+        let Some(prefetch_tokens) = self
+            .cxl_prefetch_client
+            .prepare_tokens(tokens, &candidate_block_indices)
+        else {
+            tracing::debug!(
+                request_id,
+                worker_id = worker.worker_id,
+                dp_rank = worker.dp_rank,
+                candidate_blocks = candidate_blocks.len(),
+                "Route-time CXL prefetch did not pass the token threshold"
+            );
+            return;
+        };
+
+        let route_decided_unix_ns = Self::unix_time_ns();
+        let admitted = self.cxl_prefetch_client.dispatch_route(
+            request_id.to_string(),
+            prefetch_tokens,
+            worker,
+            candidate_blocks.clone(),
+            candidate_block_indices,
+            PrefetchTrace {
+                route_decided_unix_ns: Some(route_decided_unix_ns),
+                ..PrefetchTrace::default()
+            },
+        );
+        tracing::info!(
+            request_id,
+            worker_id = worker.worker_id,
+            dp_rank = worker.dp_rank,
+            cxl_candidate_blocks = candidate_blocks.len(),
+            admitted,
+            route_decided_unix_ns,
+            "Route-time CXL prefetch hint evaluated"
+        );
+    }
+
+    /// Inspect the exact selected-worker residency and attach a bounded CXL
+    /// hint to the request envelope.  No worker RPC is issued here: the
+    /// selected worker will register the promotion before servicing this
+    /// request's first LMCache lookup.
+    fn prepare_cxl_prefetch_hint_for_route(
+        &self,
+        request_id: &str,
+        tokens: &[u32],
+        worker: WorkerWithDpRank,
+        overlaps: &OverlapScores,
+    ) -> Option<CxlPrefetchHint> {
+        if !self.cxl_prefetch_client.enabled() || tokens.is_empty() {
+            return None;
+        }
+
+        let candidate_indices: Vec<u32> = cxl_only_prefetch_metadata(
+            overlaps,
+            worker,
+            self.cxl_prefetch_client.max_scan_chunks(),
+            self.cxl_prefetch_client.max_scan_chunks(),
+        )
+        .into_iter()
+        .map(|metadata| metadata.block_index)
+        .collect();
+
+        let route_decided_unix_ns = Self::unix_time_ns() as u64;
+        let hint = self.cxl_prefetch_client.build_request_hint(
+            tokens,
+            &candidate_indices,
+            route_decided_unix_ns,
+        );
+        if hint.is_some() {
+            tracing::info!(
+                request_id,
+                worker_id = worker.worker_id,
+                dp_rank = worker.dp_rank,
+                cxl_candidate_blocks = candidate_indices.len(),
+                admitted = true,
+                route_decided_unix_ns,
+                transport = "request_envelope",
+                "Route-time CXL prefetch hint evaluated"
+            );
+        } else {
+            tracing::debug!(
+                request_id,
+                worker_id = worker.worker_id,
+                dp_rank = worker.dp_rank,
+                cxl_candidate_blocks = candidate_indices.len(),
+                admitted = false,
+                route_decided_unix_ns,
+                transport = "request_envelope",
+                "Route-time CXL prefetch hint unavailable"
+            );
+        }
+        hint
+    }
+
     fn register_virtual_prefetch(&self, reservations: &[PrefetchReservation]) {
         let Ok(mut virtual_prefetch) = self.virtual_prefetch.lock() else {
             tracing::warn!("Unable to register virtual prefetch reservation: mutex poisoned");
@@ -887,8 +1033,8 @@ impl KvRouter {
         Ok((best_worker, overlap_amount))
     }
 
-    /// Route while retaining the bounded token prefix needed by the
-    /// waiting-route lookahead scheduler.
+    /// Route and, after the final worker choice, evaluate a route-time CXL
+    /// prefetch hint for that same worker.
     pub async fn find_best_match_with_session_details(
         &self,
         context_id: Option<&str>,
@@ -898,6 +1044,54 @@ impl KvRouter {
         router_config_override: Option<&RouterConfigOverride>,
         update_states: bool,
     ) -> anyhow::Result<(WorkerWithDpRank, u32)> {
+        let decision = self
+            .find_best_match_with_session_details_internal(
+                context_id,
+                session_id,
+                model_id,
+                tokens,
+                router_config_override,
+                update_states,
+                false,
+            )
+            .await?;
+        Ok((decision.best_worker, decision.overlap_amount))
+    }
+
+    /// Route a request and return the request-carried CXL hint.  This is used
+    /// by `KvPushRouter`, which can attach the hint before forwarding the
+    /// request to the selected worker.
+    async fn find_best_match_with_session_details_for_request(
+        &self,
+        context_id: Option<&str>,
+        session_id: Option<&str>,
+        model_id: Option<&str>,
+        tokens: &[u32],
+        router_config_override: Option<&RouterConfigOverride>,
+        update_states: bool,
+    ) -> anyhow::Result<RouteDecision> {
+        self.find_best_match_with_session_details_internal(
+            context_id,
+            session_id,
+            model_id,
+            tokens,
+            router_config_override,
+            update_states,
+            true,
+        )
+        .await
+    }
+
+    async fn find_best_match_with_session_details_internal(
+        &self,
+        context_id: Option<&str>,
+        session_id: Option<&str>,
+        model_id: Option<&str>,
+        tokens: &[u32],
+        router_config_override: Option<&RouterConfigOverride>,
+        update_states: bool,
+        carry_cxl_hint: bool,
+    ) -> anyhow::Result<RouteDecision> {
         // Validate that context_id is provided when update_states is true
         if update_states && context_id.is_none() {
             panic!("context_id must be provided if update_states is true");
@@ -914,26 +1108,15 @@ impl KvRouter {
             .kv_router_config
             .compute_seq_hashes_for_tracking(tokens, self.block_size);
 
-        // Raw token IDs are normally carried only for an enabled lookahead
-        // client.  Timeline validation also needs them in baseline so the
-        // waiting-candidate denominator is measured at the same queue point;
-        // this remains default-off with the timeline flag.
-        let timeline_enabled = env::var("DYN_CXL_PREFETCH_TIMELINE_ENABLED")
-            .ok()
-            .and_then(|value| value.parse::<bool>().ok())
-            .unwrap_or(false);
-        let prefetch_token_ids = (self.cxl_prefetch_client.lookahead_enabled() || timeline_enabled)
-            .then(|| tokens.to_vec());
         let scheduling_response = self
             .scheduler
-            .schedule_with_details_and_tokens(
+            .schedule_with_details(
                 context_id.map(|s| s.to_string()),
                 isl_tokens,
                 maybe_seq_hashes,
                 overlap_scores.clone(),
                 router_config_override,
                 update_states,
-                prefetch_token_ids,
             )
             .await?;
         let best_worker = scheduling_response.best_worker;
@@ -943,7 +1126,6 @@ impl KvRouter {
             planner.observe(
                 tokens,
                 self.block_size,
-                best_worker,
                 &overlap_scores,
                 &scheduling_response.decode_blocks,
                 &scheduling_response.prefill_tokens,
@@ -951,6 +1133,20 @@ impl KvRouter {
         }
 
         if update_states && let Some(request_id) = context_id {
+            let cxl_prefetch_hint = if carry_cxl_hint {
+                self.prepare_cxl_prefetch_hint_for_route(
+                    request_id,
+                    tokens,
+                    best_worker,
+                    &overlap_scores,
+                )
+            } else {
+                // Keep the standalone KvRouter API compatible for callers
+                // that do not forward a request envelope. The main push
+                // route uses the request-carried path above.
+                self.issue_cxl_prefetch_for_route(request_id, tokens, best_worker, &overlap_scores);
+                None
+            };
             self.issue_prefetch_for_route(
                 request_id,
                 session_id,
@@ -959,6 +1155,17 @@ impl KvRouter {
                 best_worker,
                 &prefetch_candidates,
             );
+
+            let overlap_amount = overlap_scores
+                .scores
+                .get(&best_worker)
+                .copied()
+                .unwrap_or(0);
+            return Ok(RouteDecision {
+                best_worker,
+                overlap_amount,
+                cxl_prefetch_hint,
+            });
         }
 
         // Note: Routing decision recording (for approximate mode) is now handled
@@ -969,7 +1176,11 @@ impl KvRouter {
             .get(&best_worker)
             .copied()
             .unwrap_or(0);
-        Ok((best_worker, overlap_amount))
+        Ok(RouteDecision {
+            best_worker,
+            overlap_amount,
+            cxl_prefetch_hint: None,
+        })
     }
 
     pub async fn add_request(
@@ -1045,6 +1256,17 @@ impl KvRouter {
         self.block_size
     }
 
+    /// Compute the per-worker overlap and exact block-residency metadata for
+    /// a token sequence. The virtual route-time reservations are included in
+    /// aggregate scores, while `block_residency` remains the indexer's exact
+    /// CXL/CPU/GPU view for candidate filtering.
+    pub async fn get_overlap_scores(&self, tokens: &[u32]) -> Result<OverlapScores, KvRouterError> {
+        let block_hashes = compute_block_hash_for_seq(tokens, self.block_size, None);
+        let mut overlap_scores = self.indexer.find_matches(block_hashes.clone()).await?;
+        self.apply_virtual_prefetch_scores(&block_hashes, &mut overlap_scores);
+        Ok(overlap_scores)
+    }
+
     /// Compute the overlap blocks for a given token sequence and worker.
     /// This queries the indexer to find how many blocks are already cached.
     pub async fn get_overlap_blocks(
@@ -1052,10 +1274,13 @@ impl KvRouter {
         tokens: &[u32],
         worker: WorkerWithDpRank,
     ) -> Result<u32, KvRouterError> {
-        let block_hashes = compute_block_hash_for_seq(tokens, self.block_size, None);
-        let mut overlap_scores = self.indexer.find_matches(block_hashes.clone()).await?;
-        self.apply_virtual_prefetch_scores(&block_hashes, &mut overlap_scores);
-        Ok(overlap_scores.scores.get(&worker).copied().unwrap_or(0))
+        Ok(self
+            .get_overlap_scores(tokens)
+            .await?
+            .scores
+            .get(&worker)
+            .copied()
+            .unwrap_or(0))
     }
 
     /// Get potential prefill and decode loads for all workers
@@ -1238,6 +1463,16 @@ struct WorkerSelection {
     instance_id: u64,
     dp_rank: u32,
     overlap_amount: u32,
+    cxl_prefetch_hint: Option<CxlPrefetchHint>,
+}
+
+/// Internal route result used to carry the request-scoped CXL hint from the
+/// chooser to the push router without exposing it through the public router
+/// query API.
+struct RouteDecision {
+    best_worker: WorkerWithDpRank,
+    overlap_amount: u32,
+    cxl_prefetch_hint: Option<CxlPrefetchHint>,
 }
 
 impl KvPushRouter {
@@ -1287,9 +1522,9 @@ impl KvPushRouter {
         }) else {
             // No preselected worker - find the best match
             // Don't update states if this is a query-only request
-            let (best_worker, overlap_amount) = self
+            let decision = self
                 .chooser
-                .find_best_match_with_session_details(
+                .find_best_match_with_session_details_for_request(
                     Some(context_id),
                     session_id,
                     Some(&request.model),
@@ -1298,6 +1533,8 @@ impl KvPushRouter {
                     !is_query_only,
                 )
                 .await?;
+            let best_worker = decision.best_worker;
+            let overlap_amount = decision.overlap_amount;
 
             tracing::info!(
                 "Routing decision: Selected worker via find_best_match: worker_id={} dp_rank={:?}, overlap_amount={} (phase={:?})",
@@ -1311,6 +1548,7 @@ impl KvPushRouter {
                 instance_id: best_worker.worker_id,
                 dp_rank: best_worker.dp_rank,
                 overlap_amount,
+                cxl_prefetch_hint: decision.cxl_prefetch_hint,
             });
         };
 
@@ -1330,23 +1568,34 @@ impl KvPushRouter {
             "Routing to specified worker"
         );
 
-        // Compute actual overlap blocks by querying the indexer
+        // Compute exact overlap/residency by querying the indexer. Even for
+        // an explicitly selected worker, route-time CXL prefetch must inspect
+        // that same final destination before sending a hint.
         let worker = WorkerWithDpRank::new(id, dp_rank);
-        let overlap_blocks = self
-            .chooser
-            .get_overlap_blocks(&request.token_ids, worker)
-            .await?;
+        let overlap_scores = self.chooser.get_overlap_scores(&request.token_ids).await?;
+        let overlap_blocks = overlap_scores.scores.get(&worker).copied().unwrap_or(0);
 
-        if !is_query_only && handle_local_updates {
-            self.chooser.issue_prefetch_for_route(
+        let cxl_prefetch_hint = if !is_query_only {
+            let hint = self.chooser.prepare_cxl_prefetch_hint_for_route(
                 context_id,
-                session_id,
-                Some(&request.model),
                 &request.token_ids,
                 worker,
-                &[],
+                &overlap_scores,
             );
-        }
+            if handle_local_updates {
+                self.chooser.issue_prefetch_for_route(
+                    context_id,
+                    session_id,
+                    Some(&request.model),
+                    &request.token_ids,
+                    worker,
+                    &build_prefetch_candidates(&overlap_scores, worker),
+                );
+            }
+            hint
+        } else {
+            None
+        };
 
         // Extract expected_output_tokens from routing hints
         let expected_output_tokens = request
@@ -1378,6 +1627,7 @@ impl KvPushRouter {
             instance_id: id,
             dp_rank,
             overlap_amount: overlap_blocks,
+            cxl_prefetch_hint,
         })
     }
 }
@@ -1445,6 +1695,7 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutpu
             instance_id,
             dp_rank,
             overlap_amount,
+            cxl_prefetch_hint,
         } = selection;
 
         // In approximate mode (use_kv_events=false), record the routing decision
@@ -1514,6 +1765,10 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutpu
 
         let (mut backend_input, context) = request.into_parts();
         backend_input.routing_mut().dp_rank = Some(dp_rank);
+        // Replace any upstream/stale hint with the result of this final route
+        // decision.  In particular, do not forward a hint to a new worker when
+        // this route has no currently useful CXL candidate.
+        backend_input.routing_mut().cxl_prefetch_hint = cxl_prefetch_hint;
         let updated_request = context.map(|_| backend_input);
 
         let chooser = self.chooser.clone();

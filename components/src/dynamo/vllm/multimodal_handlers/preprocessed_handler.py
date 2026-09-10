@@ -14,7 +14,11 @@ from vllm.sampling_params import SamplingParams as VllmSamplingParams
 
 from dynamo.runtime import Client
 
-from ..handlers import BaseWorkerHandler, build_sampling_params
+from ..handlers import (
+    BaseWorkerHandler,
+    attach_cxl_prefetch_hint,
+    build_sampling_params,
+)
 from ..multimodal_utils import (
     MultiModalGroup,
     MultiModalInput,
@@ -76,6 +80,7 @@ class PreprocessedHandler(ProcessMixIn):
         sampling_params = build_sampling_params(
             raw_request, self.default_sampling_params
         )
+        attach_cxl_prefetch_hint(raw_request, sampling_params)
 
         # [gluo WIP] encoder doesn't really need any of this
         encode_request = vLLMMultimodalRequest(
@@ -310,6 +315,7 @@ class ECProcessorHandler(PreprocessedHandler):
         sampling_params = build_sampling_params(
             raw_request, self.default_sampling_params
         )
+        attach_cxl_prefetch_hint(raw_request, sampling_params)
 
         # Create multimodal groups for encoder
         multimodal_groups = []
