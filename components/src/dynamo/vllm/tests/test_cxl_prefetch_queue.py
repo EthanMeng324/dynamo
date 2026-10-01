@@ -4,7 +4,9 @@
 
 import asyncio
 
-from dynamo.vllm.handlers import BaseWorkerHandler
+from vllm.sampling_params import SamplingParams
+
+from dynamo.vllm.handlers import BaseWorkerHandler, attach_cxl_prefetch_hint
 
 
 class _TestHandler(BaseWorkerHandler):
@@ -95,3 +97,52 @@ def test_endpoint_drops_when_worker_queue_is_full():
         await asyncio.sleep(0)
 
     asyncio.run(run_test())
+
+
+def test_route_hint_is_forwarded_through_kv_transfer_params():
+    sampling_params = SamplingParams(max_tokens=1)
+    sampling_params.extra_args = {
+        "kv_transfer_params": {"do_remote_decode": True},
+        "existing_arg": "preserved",
+    }
+    request = {
+        "routing": {
+            "cxl_prefetch_hint": {
+                "candidate_block_indices": [3, 1, 3],
+                "max_chunks": 2,
+                "route_decided_unix_ns": 123,
+            }
+        }
+    }
+
+    assert attach_cxl_prefetch_hint(request, sampling_params)
+    assert sampling_params.extra_args == {
+        "kv_transfer_params": {
+            "do_remote_decode": True,
+            "lmcache.cxl_prefetch_hint": {
+                "candidate_block_indices": [1, 3],
+                "max_chunks": 2,
+                "route_decided_unix_ns": 123,
+            },
+        },
+        "existing_arg": "preserved",
+    }
+
+
+def test_route_hint_candidate_bound_is_independent_of_batch_size():
+    sampling_params = SamplingParams(max_tokens=1)
+    request = {
+        "routing": {
+            "cxl_prefetch_hint": {
+                "candidate_block_indices": list(range(12)),
+                "max_chunks": 1,
+            }
+        }
+    }
+
+    assert attach_cxl_prefetch_hint(request, sampling_params)
+    forwarded = sampling_params.extra_args["kv_transfer_params"][
+        "lmcache.cxl_prefetch_hint"
+    ]
+    assert forwarded["candidate_block_indices"] == list(range(12))
+    assert forwarded["max_chunks"] == 1

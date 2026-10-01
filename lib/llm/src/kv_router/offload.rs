@@ -4,8 +4,10 @@
 //! Periodic, router-owned CPU-to-CXL offload planning.
 //!
 //! Request handling only records observations.  A bounded background task
-//! wakes every few seconds, ranks hot prefixes, and sends a MessagePack
-//! `OffloadMsg` over LMCache's existing ZMQ REQ/REP controller endpoint.  The
+//! wakes every few seconds, ranks repeated prefixes by CPU-locality skew, and
+//! sends a MessagePack
+//! `OffloadMsg` over LMCache's existing ZMQ REQ/ROUTER-compatible controller
+//! endpoint.  The
 //! planner deliberately does not mutate Dynamo residency: only the normal CXL
 //! `BlockStored` event can make a copy routable.
 
@@ -25,7 +27,9 @@ use tokio_util::sync::CancellationToken;
 use zeromq::{ReqSocket, Socket, SocketRecv, SocketSend, ZmqMessage};
 
 use super::{
-    KvRouterConfig, compute_block_hash_for_seq, indexer::OverlapScores, protocols::WorkerWithDpRank,
+    KvRouterConfig, compute_block_hash_for_seq,
+    indexer::{BlockResidencyMetadata, OverlapScores},
+    protocols::WorkerWithDpRank,
 };
 
 #[derive(Debug, Clone)]
@@ -35,12 +39,15 @@ struct PlannerConfig {
     interval: Duration,
     window: Duration,
     hot_threshold: u32,
-    owner_load_threshold: u64,
-    top_k: usize,
+    skew_threshold: f64,
+    max_offloads_per_round: usize,
     max_chunks: usize,
-    /// Kept for wire/config compatibility; admission is deliberately single
-    /// concurrent so a background copy cannot create a burst of CXL traffic.
+    /// Bound concurrent background operations so a planner round cannot
+    /// create an unbounded burst of CXL traffic.
     max_inflight: usize,
+    /// Number of independent controller REQ sockets used by the opt-in
+    /// task-parallel path.  One preserves the legacy serialized RPC path.
+    rpc_parallelism: usize,
     /// Do not admit background copies while serving pressure is above these
     /// thresholds.  The values are snapshots supplied by the scheduler.
     max_serving_decode_blocks: u64,
@@ -51,6 +58,9 @@ struct PlannerConfig {
     /// Conservative estimate used to reserve a bounded per-operation budget.
     chunk_bytes: u64,
     cooldown: Duration,
+    /// Suppress a globally committed prefix while the event-backed index
+    /// catches up. A timeout permits recovery when an event is lost.
+    visibility_timeout: Duration,
     endpoint: Option<String>,
     instance_template: Option<String>,
     instance_map: HashMap<u64, String>,
@@ -59,6 +69,24 @@ struct PlannerConfig {
 
 impl PlannerConfig {
     fn from_config(config: KvRouterConfig) -> Self {
+        let legacy_max_offloads_per_round =
+            env_usize("DYN_BACKGROUND_OFFLOAD_TOP_K", config.offload_top_k);
+        let max_offloads_per_round = env_usize(
+            "DYN_BACKGROUND_OFFLOAD_MAX_PER_ROUND",
+            // TOP_K is the old public knob. Keep it as a fallback so existing
+            // deployments can adopt the new selector without a flag change.
+            legacy_max_offloads_per_round,
+        )
+        .max(1);
+        let max_inflight = env_usize(
+            "DYN_BACKGROUND_OFFLOAD_MAX_INFLIGHT",
+            config.offload_max_inflight,
+        )
+        .max(1)
+        .min(max_offloads_per_round);
+        let rpc_parallelism = env_usize("DYN_BACKGROUND_OFFLOAD_RPC_PARALLELISM", 1)
+            .max(1)
+            .min(max_inflight);
         Self {
             enabled: env_bool(
                 "DYN_BACKGROUND_OFFLOAD_ENABLED",
@@ -83,20 +111,15 @@ impl PlannerConfig {
                 config.offload_hot_request_threshold as u64,
             )
             .max(1) as u32,
-            owner_load_threshold: env_u64(
-                "DYN_BACKGROUND_OFFLOAD_OWNER_LOAD_THRESHOLD",
-                config.offload_owner_load_threshold,
-            ),
-            top_k: env_usize("DYN_BACKGROUND_OFFLOAD_TOP_K", config.offload_top_k).max(1),
+            skew_threshold: env_f64("DYN_BACKGROUND_OFFLOAD_SKEW_THRESHOLD", 0.5).clamp(0.0, 1.0),
+            max_offloads_per_round,
             max_chunks: env_usize(
                 "DYN_BACKGROUND_OFFLOAD_MAX_CHUNKS",
                 config.offload_max_chunks,
             )
             .max(1),
-            // Automatic offload is intentionally serialized.  Keep reading
-            // the old setting so existing configurations remain parseable,
-            // but do not let it reintroduce concurrent CXL copies.
-            max_inflight: 1,
+            max_inflight,
+            rpc_parallelism,
             max_serving_decode_blocks: env_u64(
                 "DYN_BACKGROUND_OFFLOAD_MAX_ACTIVE_DECODE_BLOCKS",
                 16,
@@ -111,6 +134,9 @@ impl PlannerConfig {
                 "DYN_BACKGROUND_OFFLOAD_COOLDOWN_SECS",
                 config.offload_cooldown_secs,
             )),
+            visibility_timeout: Duration::from_millis(
+                env_u64("DYN_BACKGROUND_OFFLOAD_VISIBILITY_TIMEOUT_MS", 30_000).max(1),
+            ),
             endpoint: env::var("DYN_LMCACHE_CONTROLLER_ENDPOINT").ok(),
             instance_template: env::var("DYN_BACKGROUND_OFFLOAD_INSTANCE_TEMPLATE").ok(),
             instance_map: parse_instance_map(
@@ -144,6 +170,13 @@ fn env_u64(name: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
+fn env_f64(name: &str, default: f64) -> f64 {
+    env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .unwrap_or(default)
+}
+
 fn env_usize(name: &str, default: usize) -> usize {
     env_u64(name, default as u64) as usize
 }
@@ -165,17 +198,139 @@ struct PrefixKey {
     hashes: Vec<u64>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrefixOffloadState {
+    /// The prefix has a CPU source and is not fully visible in CXL.
+    CpuOnly,
+    /// A copy operation has been dispatched and has not completed locally.
+    Copying,
+    /// The controller completed the global commit, but the normal CXL event
+    /// has not yet made the complete prefix visible in the router index.
+    AwaitingVisibility,
+    /// The prefix is fully visible in CXL according to the latest index view.
+    CpuAndCxl,
+}
+
+/// Count the blocks that are continuously resident from the beginning of a
+/// matched request prefix. Aggregate tier scores count blocks independently
+/// and can overestimate a prefix when a worker misses an early block, so the
+/// selector uses the bounded per-block metadata instead.
+fn continuous_residency_blocks(
+    metadata: &[BlockResidencyMetadata],
+    prefix_blocks: usize,
+    predicate: impl Fn(&BlockResidencyMetadata) -> bool,
+) -> usize {
+    (0..prefix_blocks)
+        .take_while(|block_index| {
+            metadata
+                .iter()
+                .any(|entry| entry.block_index == *block_index as u32 && predicate(entry))
+        })
+        .count()
+}
+
+fn cpu_coverage(overlaps: &OverlapScores, prefix_blocks: usize) -> HashMap<WorkerWithDpRank, f64> {
+    if prefix_blocks == 0 {
+        return HashMap::new();
+    }
+
+    overlaps
+        .block_residency
+        .iter()
+        .filter_map(|(worker, metadata)| {
+            let continuous_blocks =
+                continuous_residency_blocks(metadata, prefix_blocks, |entry| entry.cpu);
+            (continuous_blocks > 0)
+                .then(|| (*worker, continuous_blocks as f64 / prefix_blocks as f64))
+        })
+        .collect()
+}
+
+fn cxl_prefix_ready(overlaps: &OverlapScores, prefix_blocks: usize) -> bool {
+    prefix_blocks > 0
+        && overlaps.block_residency.values().any(|metadata| {
+            continuous_residency_blocks(metadata, prefix_blocks, |entry| entry.cxl) == prefix_blocks
+        })
+}
+
+fn best_cpu_worker(coverage: &HashMap<WorkerWithDpRank, f64>) -> Option<(WorkerWithDpRank, f64)> {
+    coverage
+        .iter()
+        .max_by(|(worker_a, coverage_a), (worker_b, coverage_b)| {
+            coverage_a
+                .total_cmp(coverage_b)
+                // Prefer the lower worker identity when coverage is equal so
+                // source selection does not depend on HashMap iteration order.
+                .then_with(|| worker_b.cmp(worker_a))
+        })
+        .map(|(worker, coverage)| (*worker, *coverage))
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CandidateScore {
+    source_worker: WorkerWithDpRank,
+    skew: f64,
+    priority: f64,
+}
+
+fn score_candidate(
+    stat: &PrefixStat,
+    hot_threshold: u32,
+    skew_threshold: f64,
+) -> Option<CandidateScore> {
+    if stat.recent_requests < hot_threshold || stat.state != PrefixOffloadState::CpuOnly {
+        return None;
+    }
+
+    let (source_worker, best_coverage) = best_cpu_worker(&stat.cpu_coverage)?;
+    let mut coverages: Vec<f64> = stat.cpu_coverage.values().copied().collect();
+    coverages.sort_by(|a, b| b.total_cmp(a));
+    let second_best_coverage = coverages.get(1).copied().unwrap_or(0.0);
+    let skew = (best_coverage - second_best_coverage).max(0.0);
+    if skew < skew_threshold {
+        return None;
+    }
+
+    Some(CandidateScore {
+        source_worker,
+        skew,
+        priority: stat.recent_requests as f64 * skew,
+    })
+}
+
+/// A small cross-language fingerprint used only for benchmark observability.
+///
+/// The offload planner already owns the exact token prefix that it sends to
+/// LMCache, while the worker-side completion log owns the actual tier hit
+/// counts.  Logging a deterministic token fingerprint lets the benchmark join
+/// those two records without changing the wire protocol or the cache key.
+fn prefix_fingerprint(tokens: &[u32]) -> u64 {
+    const OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+    const PRIME: u64 = 0x100000001b3;
+    let mut fingerprint = OFFSET_BASIS;
+    for token in tokens {
+        for byte in token.to_le_bytes() {
+            fingerprint ^= u64::from(byte);
+            fingerprint = fingerprint.wrapping_mul(PRIME);
+        }
+    }
+    fingerprint
+}
+
+fn prefix_observability_id(key: &PrefixKey, tokens: &[u32]) -> String {
+    format!("{}:{:016x}", key.hashes.len(), prefix_fingerprint(tokens))
+}
+
 #[derive(Debug, Clone)]
 struct PrefixStat {
     tokens: Arc<[u32]>,
-    owner_worker: WorkerWithDpRank,
-    owner_load: u64,
-    cxl_ready: bool,
+    cpu_coverage: HashMap<WorkerWithDpRank, f64>,
+    state: PrefixOffloadState,
     recent_requests: u32,
     window_start: Instant,
     last_seen: Instant,
     last_offload: Option<Instant>,
-    inflight: bool,
+    visibility_wait_started: Option<Instant>,
 }
 
 #[derive(Debug, Default)]
@@ -255,6 +410,9 @@ enum OffloadRequest {
         copy: bool,
         max_chunks: usize,
         max_bytes: u64,
+        /// Explicitly asks the LMCache controller to dispatch this task
+        /// asynchronously.  The default remains false for compatibility.
+        parallel: bool,
     },
 }
 
@@ -292,7 +450,11 @@ struct OffloadRpcResult {
 struct LmcacheOffloadClient {
     endpoint: String,
     timeout: Duration,
+    /// The compatibility path owns one persistent REQ socket and serializes
+    /// send/recv.  Parallel mode uses one short-lived REQ per operation.
+    rpc_parallelism: usize,
     socket: AsyncMutex<Option<ReqSocket>>,
+    parallel_slots: Arc<Semaphore>,
 }
 
 impl std::fmt::Debug for LmcacheOffloadClient {
@@ -301,33 +463,24 @@ impl std::fmt::Debug for LmcacheOffloadClient {
             .debug_struct("LmcacheOffloadClient")
             .field("endpoint", &self.endpoint)
             .field("timeout", &self.timeout)
+            .field("rpc_parallelism", &self.rpc_parallelism)
             .finish_non_exhaustive()
     }
 }
 
 impl LmcacheOffloadClient {
-    fn new(endpoint: String, timeout: Duration) -> Self {
+    fn new(endpoint: String, timeout: Duration, rpc_parallelism: usize) -> Self {
+        let rpc_parallelism = rpc_parallelism.max(1);
         Self {
             endpoint,
             timeout,
+            rpc_parallelism,
             socket: AsyncMutex::new(None),
+            parallel_slots: Arc::new(Semaphore::new(rpc_parallelism)),
         }
     }
 
-    async fn send(&self, request: OffloadRequest) -> Result<OffloadRpcResult> {
-        let payload = to_vec_named(&request).context("encode LMCache OffloadMsg")?;
-        let mut socket_guard = self.socket.lock().await;
-        if socket_guard.is_none() {
-            let mut socket = ReqSocket::new();
-            socket
-                .connect(&self.endpoint)
-                .await
-                .with_context(|| format!("connect LMCache controller {}", self.endpoint))?;
-            *socket_guard = Some(socket);
-        }
-        let socket = socket_guard
-            .as_mut()
-            .ok_or_else(|| anyhow!("LMCache REQ socket was not initialized"))?;
+    async fn exchange(&self, socket: &mut ReqSocket, payload: Vec<u8>) -> Result<OffloadRpcResult> {
         let request_result = tokio::time::timeout(self.timeout, async {
             socket
                 .send(ZmqMessage::from(Bytes::from(payload)))
@@ -391,21 +544,47 @@ impl LmcacheOffloadClient {
         })
         .await;
         match request_result {
-            Ok(Ok(success)) => Ok(success),
-            Ok(Err(error)) => {
-                // Send/receive/decode failures also leave a REQ socket in an
-                // unknown state.  Reconnect on the next bounded attempt.
-                *socket_guard = None;
-                Err(error)
-            }
-            Err(timeout_error) => {
-                // A timed-out REQ socket cannot safely accept a new request
-                // until its outstanding receive is consumed. Drop it and
-                // reconnect on the next planner attempt.
-                *socket_guard = None;
-                Err(timeout_error.into())
-            }
+            Ok(result) => result,
+            Err(timeout_error) => Err(timeout_error.into()),
         }
+    }
+
+    async fn send(&self, request: OffloadRequest) -> Result<OffloadRpcResult> {
+        let payload = to_vec_named(&request).context("encode LMCache OffloadMsg")?;
+        if self.rpc_parallelism > 1 {
+            let _permit = self
+                .parallel_slots
+                .acquire()
+                .await
+                .context("acquire LMCache offload RPC slot")?;
+            let mut socket = ReqSocket::new();
+            socket
+                .connect(&self.endpoint)
+                .await
+                .with_context(|| format!("connect LMCache controller {}", self.endpoint))?;
+            // A fresh REQ has no poisoned state to carry into the next task.
+            return self.exchange(&mut socket, payload).await;
+        }
+
+        let mut socket_guard = self.socket.lock().await;
+        if socket_guard.is_none() {
+            let mut socket = ReqSocket::new();
+            socket
+                .connect(&self.endpoint)
+                .await
+                .with_context(|| format!("connect LMCache controller {}", self.endpoint))?;
+            *socket_guard = Some(socket);
+        }
+        let socket = socket_guard
+            .as_mut()
+            .ok_or_else(|| anyhow!("LMCache REQ socket was not initialized"))?;
+        let result = self.exchange(socket, payload).await;
+        if result.is_err() {
+            // Send/receive/decode failures leave a REQ socket in an unknown
+            // state.  Reconnect on the next bounded attempt.
+            *socket_guard = None;
+        }
+        result
     }
 }
 
@@ -442,14 +621,15 @@ impl BackgroundOffloadPlanner {
             );
             return None;
         }
-        let client = config
-            .endpoint
-            .clone()
-            .map(|endpoint| Arc::new(LmcacheOffloadClient::new(endpoint, config.timeout)));
+        let client = config.endpoint.clone().map(|endpoint| {
+            Arc::new(LmcacheOffloadClient::new(
+                endpoint,
+                config.timeout,
+                config.rpc_parallelism,
+            ))
+        });
         let planner = Arc::new(Self {
-            // Single background copy at a time is part of the admission
-            // contract, independent of the legacy max-inflight knob.
-            inflight: Arc::new(Semaphore::new(1)),
+            inflight: Arc::new(Semaphore::new(config.max_inflight)),
             byte_limiter: Mutex::new(ByteRateLimiter::new(
                 config.bytes_per_sec,
                 config.chunk_bytes,
@@ -462,12 +642,14 @@ impl BackgroundOffloadPlanner {
             interval_ms = planner.config.interval.as_millis(),
             window_ms = planner.config.window.as_millis(),
             hot_threshold = planner.config.hot_threshold,
-            owner_load_threshold = planner.config.owner_load_threshold,
+            skew_threshold = planner.config.skew_threshold,
+            max_offloads_per_round = planner.config.max_offloads_per_round,
+            max_inflight = planner.config.max_inflight,
+            rpc_parallelism = planner.config.rpc_parallelism,
             max_active_decode_blocks = planner.config.max_serving_decode_blocks,
             max_pending_prefill_tokens = planner.config.max_serving_prefill_tokens,
             bytes_per_sec = planner.config.bytes_per_sec,
             chunk_bytes = planner.config.chunk_bytes,
-            max_inflight = planner.config.max_inflight,
             dry_run = planner.config.dry_run,
             "Background CPU-to-CXL offload planner enabled"
         );
@@ -483,11 +665,13 @@ impl BackgroundOffloadPlanner {
         &self,
         tokens: &[u32],
         block_size: u32,
-        _best_worker: WorkerWithDpRank,
         overlaps: &OverlapScores,
         decode_blocks: &HashMap<WorkerWithDpRank, usize>,
         prefill_tokens: &HashMap<WorkerWithDpRank, usize>,
     ) {
+        // Keep the serving-pressure admission guard as a resource-safety
+        // signal. It does not participate in which prefix wins the CPU
+        // locality ranking.
         let serving_decode_blocks = decode_blocks
             .values()
             .fold(0u64, |total, value| total.saturating_add(*value as u64));
@@ -513,56 +697,8 @@ impl BackgroundOffloadPlanner {
         let key = PrefixKey {
             hashes: hashes[..chunk_count].iter().map(|hash| hash.0).collect(),
         };
-        // A source prefix is usable for offload when its CPU copy is visible
-        // either as CPU-only or alongside a GPU copy.  The latter is common
-        // before GPU eviction and must not be excluded merely because the
-        // scheduler gives GPU residency its own routing bucket.
-        let mut source_scores = HashMap::new();
-        for (worker, score) in overlaps
-            .cpu_scores
-            .iter()
-            .chain(overlaps.gpu_and_cpu_scores.iter())
-        {
-            let entry = source_scores.entry(*worker).or_insert(0u32);
-            *entry = entry.saturating_add(*score);
-        }
-        let Some(source_worker) = source_scores
-            .iter()
-            .max_by_key(|(_, score)| *score)
-            .filter(|(_, score)| **score > 0)
-            .map(|(worker, _)| *worker)
-        else {
-            // A GPU-only/no-cache route has no LocalCPU source and should not
-            // trigger a futile CPU lookup/offload attempt.
-            return;
-        };
-        let owner_load = decode_blocks
-            .get(&source_worker)
-            .copied()
-            .unwrap_or_default() as u64
-            + prefill_tokens
-                .get(&source_worker)
-                .copied()
-                .unwrap_or_default()
-                .div_ceil(block_size as usize) as u64;
-        let cxl_ready = overlaps
-            .cxl_resident_scores
-            .get(&source_worker)
-            .copied()
-            .unwrap_or(0)
-            > 0
-            || overlaps
-                .cxl_scores
-                .get(&source_worker)
-                .copied()
-                .unwrap_or(0)
-                > 0
-            || overlaps
-                .cpu_and_cxl_scores
-                .get(&source_worker)
-                .copied()
-                .unwrap_or(0)
-                > 0;
+        let current_cpu_coverage = cpu_coverage(overlaps, chunk_count);
+        let cxl_ready = cxl_prefix_ready(overlaps, chunk_count);
         let now = Instant::now();
         let Ok(mut state) = self.state.lock() else {
             tracing::warn!("Background offload planner state mutex poisoned");
@@ -570,14 +706,17 @@ impl BackgroundOffloadPlanner {
         };
         let stat = state.prefixes.entry(key).or_insert_with(|| PrefixStat {
             tokens: Arc::from(prefix_tokens.clone()),
-            owner_worker: source_worker,
-            owner_load,
-            cxl_ready,
+            cpu_coverage: current_cpu_coverage.clone(),
+            state: if cxl_ready {
+                PrefixOffloadState::CpuAndCxl
+            } else {
+                PrefixOffloadState::CpuOnly
+            },
             recent_requests: 0,
             window_start: now,
             last_seen: now,
             last_offload: None,
-            inflight: false,
+            visibility_wait_started: None,
         });
         if now.duration_since(stat.window_start) > self.config.window {
             stat.recent_requests = 0;
@@ -585,12 +724,27 @@ impl BackgroundOffloadPlanner {
         }
         stat.recent_requests = stat.recent_requests.saturating_add(1);
         stat.tokens = Arc::from(prefix_tokens);
-        stat.owner_worker = source_worker;
-        stat.owner_load = owner_load;
-        // Residency is driven by the latest index observation.  Do not keep
-        // a stale `true` after CXL eviction/removal; the next hot window may
-        // legitimately admit the prefix again.
-        stat.cxl_ready = cxl_ready;
+        // Keep the latest CPU coverage rather than averaging historical
+        // observations: CPU residency changes with eviction and new writes.
+        stat.cpu_coverage = current_cpu_coverage;
+        // Do not overwrite an in-flight or committed operation until
+        // event-backed CXL visibility is confirmed by a route observation.
+        if matches!(
+            stat.state,
+            PrefixOffloadState::Copying | PrefixOffloadState::AwaitingVisibility
+        ) {
+            if cxl_ready {
+                stat.state = PrefixOffloadState::CpuAndCxl;
+                stat.visibility_wait_started = None;
+            }
+        } else {
+            stat.state = if cxl_ready {
+                PrefixOffloadState::CpuAndCxl
+            } else {
+                PrefixOffloadState::CpuOnly
+            };
+            stat.visibility_wait_started = None;
+        }
         stat.last_seen = now;
     }
 
@@ -606,7 +760,8 @@ impl BackgroundOffloadPlanner {
 
     async fn plan_once(self: &Arc<Self>) {
         let now = Instant::now();
-        let mut candidates = Vec::new();
+        let mut candidates: Vec<(PrefixKey, Arc<[u32]>, WorkerWithDpRank, u32, f64, f64)> =
+            Vec::new();
         {
             let Ok(mut state) = self.state.lock() else {
                 tracing::warn!("Background offload planner state mutex poisoned");
@@ -634,35 +789,57 @@ impl BackgroundOffloadPlanner {
                     stat.window_start = now;
                     continue;
                 }
+                if stat.state == PrefixOffloadState::AwaitingVisibility {
+                    let visibility_timed_out = stat
+                        .visibility_wait_started
+                        .map(|started| {
+                            now.duration_since(started) >= self.config.visibility_timeout
+                        })
+                        .unwrap_or(true);
+                    if !visibility_timed_out {
+                        continue;
+                    }
+                    tracing::warn!(
+                        prefix_blocks = key.hashes.len(),
+                        timeout_ms = self.config.visibility_timeout.as_millis(),
+                        "CXL offload visibility confirmation timed out; allowing retry"
+                    );
+                    stat.state = PrefixOffloadState::CpuOnly;
+                    stat.visibility_wait_started = None;
+                }
                 let cooldown_done = stat
                     .last_offload
                     .map(|last| now.duration_since(last) >= self.config.cooldown)
                     .unwrap_or(true);
-                if stat.recent_requests >= self.config.hot_threshold
-                    && stat.owner_load >= self.config.owner_load_threshold
-                    && !stat.cxl_ready
-                    && !stat.inflight
-                    && cooldown_done
-                {
-                    candidates.push((
-                        key.clone(),
-                        stat.tokens.clone(),
-                        stat.owner_worker,
-                        stat.recent_requests,
-                    ));
+                if !cooldown_done {
+                    continue;
                 }
+                let Some(score) =
+                    score_candidate(stat, self.config.hot_threshold, self.config.skew_threshold)
+                else {
+                    continue;
+                };
+                candidates.push((
+                    key.clone(),
+                    stat.tokens.clone(),
+                    score.source_worker,
+                    stat.recent_requests,
+                    score.skew,
+                    score.priority,
+                ));
             }
         }
-        candidates.sort_by_key(|(_, tokens, _, request_count)| {
-            (
-                std::cmp::Reverse(*request_count),
-                std::cmp::Reverse(tokens.len()),
-            )
+        candidates.sort_by(|a, b| {
+            b.5.total_cmp(&a.5)
+                .then_with(|| b.4.total_cmp(&a.4))
+                .then_with(|| b.3.cmp(&a.3))
+                .then_with(|| b.1.len().cmp(&a.1.len()))
+                .then_with(|| a.0.hashes.cmp(&b.0.hashes))
         });
-        candidates.truncate(self.config.top_k);
-        for (key, tokens, owner, _) in candidates {
-            // Reserve both the single execution slot and the byte budget
-            // before changing candidate state.  A failed admission therefore
+        candidates.truncate(self.config.max_offloads_per_round);
+        for (key, tokens, source_worker, _, _, _) in candidates {
+            // Reserve both the bounded execution slot and the byte budget
+            // before changing candidate state. A failed admission therefore
             // remains eligible on the next planner tick.
             let Ok(permit) = Arc::clone(&self.inflight).try_acquire_owned() else {
                 break;
@@ -682,20 +859,20 @@ impl BackgroundOffloadPlanner {
                 );
                 continue;
             }
-            // Mark only the candidates that survived top-K ranking.  Marking
-            // the complete pre-truncation set would strand entries in
-            // `inflight=true` forever when top-K or the semaphore drops them.
+            // Mark only the candidates that survived priority ranking. A
+            // failed admission remains eligible on the next planner tick.
             let marked = self
                 .state
                 .lock()
                 .ok()
                 .and_then(|mut state| {
                     let stat = state.prefixes.get_mut(&key)?;
-                    if stat.inflight {
+                    if stat.state != PrefixOffloadState::CpuOnly {
                         return Some(false);
                     }
-                    stat.inflight = true;
+                    stat.state = PrefixOffloadState::Copying;
                     stat.last_offload = Some(now);
+                    stat.visibility_wait_started = None;
                     Some(true)
                 })
                 .unwrap_or(false);
@@ -709,20 +886,26 @@ impl BackgroundOffloadPlanner {
             let planner = Arc::clone(self);
             tokio::spawn(async move {
                 let _permit = permit;
-                planner.execute(key, tokens, owner, reserved_bytes).await;
+                planner
+                    .execute(key, tokens, source_worker, reserved_bytes)
+                    .await;
             });
-            // The semaphore is intentionally one-wide.  Avoid walking the
-            // remaining top-K candidates only to mark and immediately clear
-            // them while this operation is active.
-            break;
         }
     }
 
-    fn clear_inflight(&self, key: &PrefixKey) {
+    fn finish_inflight(&self, key: &PrefixKey, globally_committed: bool) {
         if let Ok(mut state) = self.state.lock()
             && let Some(stat) = state.prefixes.get_mut(key)
         {
-            stat.inflight = false;
+            if stat.state == PrefixOffloadState::Copying {
+                if globally_committed {
+                    stat.state = PrefixOffloadState::AwaitingVisibility;
+                    stat.visibility_wait_started = Some(Instant::now());
+                } else {
+                    stat.state = PrefixOffloadState::CpuOnly;
+                    stat.visibility_wait_started = None;
+                }
+            }
         }
     }
 
@@ -733,12 +916,24 @@ impl BackgroundOffloadPlanner {
         owner: WorkerWithDpRank,
         reserved_bytes: u64,
     ) {
+        let prefix_id = prefix_observability_id(&key, tokens.as_ref());
+        let event_id = format!("background-offload-{}", uuid::Uuid::new_v4());
+        tracing::info!(
+            %event_id,
+            %prefix_id,
+            worker_id = owner.worker_id,
+            dp_rank = owner.dp_rank,
+            chunks = key.hashes.len(),
+            tokens = tokens.len(),
+            "Background CXL offload dispatch"
+        );
         let result: Result<OffloadRpcResult> = if self.config.dry_run {
             tracing::info!(
                 worker_id = owner.worker_id,
                 dp_rank = owner.dp_rank,
                 chunks = key.hashes.len(),
                 tokens = tokens.len(),
+                %prefix_id,
                 "Background CXL offload dry-run candidate"
             );
             Ok(OffloadRpcResult {
@@ -750,7 +945,7 @@ impl BackgroundOffloadPlanner {
                 (Some(client), Some(instance_id)) => {
                     client
                         .send(OffloadRequest::OffloadMsg {
-                            event_id: format!("background-offload-{}", uuid::Uuid::new_v4()),
+                            event_id,
                             instance_id,
                             tokens: tokens.to_vec(),
                             source: "LocalCPUBackend".to_string(),
@@ -758,6 +953,7 @@ impl BackgroundOffloadPlanner {
                             copy: true,
                             max_chunks: key.hashes.len().min(self.config.max_chunks),
                             max_bytes: reserved_bytes,
+                            parallel: self.config.rpc_parallelism > 1,
                         })
                         .await
                 }
@@ -780,19 +976,16 @@ impl BackgroundOffloadPlanner {
                     "Background CXL offload completed without CXL_READY success"
                 );
             }
-            if let Ok(mut state) = self.state.lock()
-                && let Some(stat) = state.prefixes.get_mut(&key)
-            {
-                stat.inflight = false;
-                // An RPC success only means that the rank-local writes
-                // completed.  Keep routing disabled until a real CXL
-                // CacheStoreEvent is observed on a subsequent request.
-            }
+            // Controller success means every registered rank completed the
+            // global CXL commit. Keep this prefix suppressed while the normal
+            // event/index path catches up; only that path makes it routable.
+            // The visibility timeout permits retry if an event is lost.
+            self.finish_inflight(&key, rpc_result.success);
         } else {
             if let Ok(mut limiter) = self.byte_limiter.lock() {
                 limiter.refund(reserved_bytes, 0);
             }
-            self.clear_inflight(&key);
+            self.finish_inflight(&key, false);
         }
     }
 
@@ -815,15 +1008,108 @@ impl BackgroundOffloadPlanner {
 mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use tokio::sync::Semaphore;
 
     use super::{
-        BackgroundOffloadPlanner, ByteRateLimiter, PlannerConfig, PlannerState, PrefixStat,
-        parse_instance_map,
+        BackgroundOffloadPlanner, ByteRateLimiter, PlannerConfig, PlannerState, PrefixKey,
+        PrefixOffloadState, PrefixStat, continuous_residency_blocks, parse_instance_map,
+        score_candidate,
     };
-    use crate::kv_router::{indexer::OverlapScores, protocols::WorkerWithDpRank};
+    use crate::kv_router::{
+        indexer::{BlockResidencyMetadata, OverlapScores},
+        protocols::{LocalBlockHash, WorkerWithDpRank},
+    };
+
+    fn test_config() -> PlannerConfig {
+        PlannerConfig {
+            enabled: true,
+            dry_run: true,
+            interval: Duration::from_secs(5),
+            window: Duration::from_secs(10),
+            hot_threshold: 3,
+            skew_threshold: 0.5,
+            max_offloads_per_round: 2,
+            max_chunks: 16,
+            max_inflight: 2,
+            rpc_parallelism: 1,
+            max_serving_decode_blocks: 8,
+            max_serving_prefill_tokens: 0,
+            bytes_per_sec: 1024,
+            chunk_bytes: 1024,
+            cooldown: Duration::from_secs(30),
+            visibility_timeout: Duration::from_secs(30),
+            endpoint: None,
+            instance_template: None,
+            instance_map: HashMap::new(),
+            timeout: Duration::from_secs(5),
+        }
+    }
+
+    fn test_planner() -> BackgroundOffloadPlanner {
+        let config = test_config();
+        let max_inflight = config.max_inflight;
+        BackgroundOffloadPlanner {
+            config,
+            state: std::sync::Mutex::new(PlannerState::default()),
+            client: None,
+            inflight: Arc::new(Semaphore::new(max_inflight)),
+            byte_limiter: std::sync::Mutex::new(ByteRateLimiter::new(1024, 1024)),
+        }
+    }
+
+    fn residency(block_index: usize, gpu: bool, cpu: bool, cxl: bool) -> BlockResidencyMetadata {
+        BlockResidencyMetadata {
+            block_index: block_index as u32,
+            block_hash: LocalBlockHash(block_index as u64),
+            gpu,
+            cpu,
+            cxl,
+            prefetch_inflight: false,
+        }
+    }
+
+    fn add_residency(
+        overlaps: &mut OverlapScores,
+        worker: WorkerWithDpRank,
+        prefix_blocks: usize,
+        cpu_blocks: usize,
+        cxl_blocks: usize,
+        gpu: bool,
+    ) {
+        overlaps.block_residency.insert(
+            worker,
+            (0..prefix_blocks)
+                .map(|block_index| {
+                    residency(
+                        block_index,
+                        gpu,
+                        block_index < cpu_blocks,
+                        block_index < cxl_blocks,
+                    )
+                })
+                .collect(),
+        );
+    }
+
+    fn prefix_stat(
+        request_count: u32,
+        cpu_coverage: HashMap<WorkerWithDpRank, f64>,
+        state: PrefixOffloadState,
+    ) -> PrefixStat {
+        let now = Instant::now();
+        PrefixStat {
+            tokens: Arc::from(vec![1, 2, 3, 4]),
+            cpu_coverage,
+            state,
+            recent_requests: request_count,
+            window_start: now,
+            last_seen: now,
+            last_offload: None,
+            visibility_wait_started: None,
+        }
+    }
 
     #[test]
     fn parses_static_worker_instance_mapping() {
@@ -845,49 +1131,15 @@ mod tests {
 
     #[test]
     fn observes_aggregate_serving_pressure() {
-        let config = PlannerConfig {
-            enabled: true,
-            dry_run: true,
-            interval: Duration::from_secs(5),
-            window: Duration::from_secs(10),
-            hot_threshold: 1,
-            owner_load_threshold: 0,
-            top_k: 100,
-            max_chunks: 8,
-            max_inflight: 1,
-            max_serving_decode_blocks: 8,
-            max_serving_prefill_tokens: 0,
-            bytes_per_sec: 0,
-            chunk_bytes: 1024,
-            cooldown: Duration::from_secs(30),
-            endpoint: None,
-            instance_template: None,
-            instance_map: HashMap::new(),
-            timeout: Duration::from_secs(5),
-        };
-        let planner = BackgroundOffloadPlanner {
-            config,
-            state: std::sync::Mutex::new(PlannerState::default()),
-            client: None,
-            inflight: Arc::new(Semaphore::new(1)),
-            byte_limiter: std::sync::Mutex::new(ByteRateLimiter::new(0, 1024)),
-        };
+        let planner = test_planner();
         let owner = WorkerWithDpRank::from_worker_id(21);
-        let mut overlaps = OverlapScores::new();
-        overlaps.cpu_scores.insert(owner, 4);
+        let overlaps = OverlapScores::new();
         let mut decode_blocks = HashMap::new();
         decode_blocks.insert(owner, 7);
         let mut prefill_tokens = HashMap::new();
         prefill_tokens.insert(owner, 33);
 
-        planner.observe(
-            &[1, 2, 3, 4],
-            4,
-            owner,
-            &overlaps,
-            &decode_blocks,
-            &prefill_tokens,
-        );
+        planner.observe(&[1, 2, 3, 4], 4, &overlaps, &decode_blocks, &prefill_tokens);
 
         let state = planner.state.lock().expect("planner state lock");
         assert_eq!(state.serving_decode_blocks, 7);
@@ -896,146 +1148,72 @@ mod tests {
 
     #[test]
     fn observes_only_chunk_aligned_prefix_tokens() {
-        let config = PlannerConfig {
-            enabled: true,
-            dry_run: true,
-            interval: Duration::from_secs(5),
-            window: Duration::from_secs(10),
-            hot_threshold: 5,
-            owner_load_threshold: 10,
-            top_k: 100,
-            max_chunks: 8,
-            max_inflight: 1,
-            max_serving_decode_blocks: u64::MAX,
-            max_serving_prefill_tokens: u64::MAX,
-            bytes_per_sec: 0,
-            chunk_bytes: 1024,
-            cooldown: Duration::from_secs(30),
-            endpoint: None,
-            instance_template: None,
-            instance_map: HashMap::new(),
-            timeout: Duration::from_secs(5),
-        };
-        let planner = BackgroundOffloadPlanner {
-            config,
-            state: std::sync::Mutex::new(PlannerState::default()),
-            client: None,
-            inflight: Arc::new(Semaphore::new(1)),
-            byte_limiter: std::sync::Mutex::new(ByteRateLimiter::new(0, 1024)),
-        };
+        let planner = test_planner();
         let owner = WorkerWithDpRank::from_worker_id(7);
         let mut overlaps = OverlapScores::new();
-        overlaps.cpu_scores.insert(owner, 4);
-        let mut decode_blocks = HashMap::new();
-        decode_blocks.insert(owner, 12);
+        add_residency(&mut overlaps, owner, 2, 2, 0, false);
 
         planner.observe(
-            &[1, 2, 3, 4, 5, 6],
+            &[1, 2, 3, 4, 5, 6, 7, 8, 9],
             4,
-            owner,
             &overlaps,
-            &decode_blocks,
+            &HashMap::new(),
             &HashMap::new(),
         );
 
         let state = planner.state.lock().expect("planner state lock");
         let stat: &PrefixStat = state.prefixes.values().next().expect("prefix stat");
-        assert_eq!(stat.tokens.as_ref(), &[1, 2, 3, 4]);
+        assert_eq!(stat.tokens.as_ref(), &[1, 2, 3, 4, 5, 6, 7, 8]);
         assert_eq!(stat.recent_requests, 1);
-        assert_eq!(stat.owner_load, 12);
-        assert!(!stat.cxl_ready);
+        assert_eq!(stat.cpu_coverage.get(&owner), Some(&1.0));
+        assert_eq!(stat.state, PrefixOffloadState::CpuOnly);
     }
 
     #[test]
     fn observes_gpu_and_cpu_prefix_when_cxl_is_absent() {
-        let config = PlannerConfig {
-            enabled: true,
-            dry_run: true,
-            interval: Duration::from_secs(5),
-            window: Duration::from_secs(10),
-            hot_threshold: 1,
-            owner_load_threshold: 0,
-            top_k: 100,
-            max_chunks: 8,
-            max_inflight: 1,
-            max_serving_decode_blocks: u64::MAX,
-            max_serving_prefill_tokens: u64::MAX,
-            bytes_per_sec: 0,
-            chunk_bytes: 1024,
-            cooldown: Duration::from_secs(30),
-            endpoint: None,
-            instance_template: None,
-            instance_map: HashMap::new(),
-            timeout: Duration::from_secs(5),
-        };
-        let planner = BackgroundOffloadPlanner {
-            config,
-            state: std::sync::Mutex::new(PlannerState::default()),
-            client: None,
-            inflight: Arc::new(Semaphore::new(1)),
-            byte_limiter: std::sync::Mutex::new(ByteRateLimiter::new(0, 1024)),
-        };
+        let planner = test_planner();
         let owner = WorkerWithDpRank::from_worker_id(11);
         let mut overlaps = OverlapScores::new();
-        overlaps.gpu_and_cpu_scores.insert(owner, 4);
-        let mut decode_blocks = HashMap::new();
-        decode_blocks.insert(owner, 3);
+        add_residency(&mut overlaps, owner, 2, 2, 0, true);
 
         planner.observe(
-            &[1, 2, 3, 4, 5, 6],
+            &[1, 2, 3, 4, 5, 6, 7, 8],
             4,
-            owner,
             &overlaps,
-            &decode_blocks,
+            &HashMap::new(),
             &HashMap::new(),
         );
 
         let state = planner.state.lock().expect("planner state lock");
         let stat = state.prefixes.values().next().expect("prefix stat");
-        assert_eq!(stat.owner_worker, owner);
         assert_eq!(stat.recent_requests, 1);
-        assert_eq!(stat.owner_load, 3);
-        assert!(!stat.cxl_ready);
+        assert_eq!(stat.cpu_coverage.get(&owner), Some(&1.0));
+        assert_eq!(stat.state, PrefixOffloadState::CpuOnly);
+    }
+
+    #[test]
+    fn continuous_cpu_coverage_stops_at_the_first_missing_block() {
+        let metadata = vec![
+            residency(0, false, true, false),
+            residency(1, false, false, false),
+            residency(2, false, true, false),
+        ];
+        assert_eq!(
+            continuous_residency_blocks(&metadata, 3, |entry| entry.cpu),
+            1
+        );
     }
 
     #[test]
     fn records_cxl_residency_even_for_gpu_and_cpu_prefixes() {
-        let config = PlannerConfig {
-            enabled: true,
-            dry_run: true,
-            interval: Duration::from_secs(5),
-            window: Duration::from_secs(10),
-            hot_threshold: 1,
-            owner_load_threshold: 0,
-            top_k: 100,
-            max_chunks: 8,
-            max_inflight: 1,
-            max_serving_decode_blocks: u64::MAX,
-            max_serving_prefill_tokens: u64::MAX,
-            bytes_per_sec: 0,
-            chunk_bytes: 1024,
-            cooldown: Duration::from_secs(30),
-            endpoint: None,
-            instance_template: None,
-            instance_map: HashMap::new(),
-            timeout: Duration::from_secs(5),
-        };
-        let planner = BackgroundOffloadPlanner {
-            config,
-            state: std::sync::Mutex::new(PlannerState::default()),
-            client: None,
-            inflight: Arc::new(Semaphore::new(1)),
-            byte_limiter: std::sync::Mutex::new(ByteRateLimiter::new(0, 1024)),
-        };
+        let planner = test_planner();
         let owner = WorkerWithDpRank::from_worker_id(12);
         let mut overlaps = OverlapScores::new();
-        overlaps.gpu_and_cpu_scores.insert(owner, 4);
-        overlaps.cxl_resident_scores.insert(owner, 4);
+        add_residency(&mut overlaps, owner, 2, 2, 2, true);
 
         planner.observe(
-            &[1, 2, 3, 4, 5, 6],
+            &[1, 2, 3, 4, 5, 6, 7, 8],
             4,
-            owner,
             &overlaps,
             &HashMap::new(),
             &HashMap::new(),
@@ -1043,6 +1221,160 @@ mod tests {
 
         let state = planner.state.lock().expect("planner state lock");
         let stat = state.prefixes.values().next().expect("prefix stat");
-        assert!(stat.cxl_ready);
+        assert_eq!(stat.state, PrefixOffloadState::CpuAndCxl);
+    }
+
+    #[test]
+    fn successful_commit_waits_for_event_visibility_without_redispatching() {
+        let planner = test_planner();
+        let owner = WorkerWithDpRank::from_worker_id(13);
+        let tokens = [1, 2, 3, 4, 5, 6, 7, 8];
+        let mut overlaps = OverlapScores::new();
+        add_residency(&mut overlaps, owner, 2, 2, 0, false);
+        planner.observe(&tokens, 4, &overlaps, &HashMap::new(), &HashMap::new());
+        let key = {
+            let mut state = planner.state.lock().expect("planner state lock");
+            let key = state.prefixes.keys().next().expect("prefix key").clone();
+            state.prefixes.get_mut(&key).expect("prefix stat").state = PrefixOffloadState::Copying;
+            key
+        };
+
+        planner.finish_inflight(&key, true);
+        {
+            let state = planner.state.lock().expect("planner state lock");
+            let stat = &state.prefixes[&key];
+            assert_eq!(stat.state, PrefixOffloadState::AwaitingVisibility);
+            assert!(stat.visibility_wait_started.is_some());
+            assert!(score_candidate(stat, 1, 0.0).is_none());
+        }
+
+        // An observation whose index view still lacks CXL must preserve the
+        // suppression state rather than returning the prefix to CpuOnly.
+        planner.observe(&tokens, 4, &overlaps, &HashMap::new(), &HashMap::new());
+        assert_eq!(
+            planner.state.lock().expect("planner state lock").prefixes[&key].state,
+            PrefixOffloadState::AwaitingVisibility
+        );
+
+        add_residency(&mut overlaps, owner, 2, 2, 2, false);
+        planner.observe(&tokens, 4, &overlaps, &HashMap::new(), &HashMap::new());
+        let state = planner.state.lock().expect("planner state lock");
+        let stat = &state.prefixes[&key];
+        assert_eq!(stat.state, PrefixOffloadState::CpuAndCxl);
+        assert!(stat.visibility_wait_started.is_none());
+    }
+
+    #[test]
+    fn failed_commit_returns_prefix_to_cpu_only() {
+        let planner = test_planner();
+        let key = PrefixKey { hashes: vec![7] };
+        let mut stat = prefix_stat(3, HashMap::new(), PrefixOffloadState::Copying);
+        stat.visibility_wait_started = Some(Instant::now());
+        planner
+            .state
+            .lock()
+            .expect("planner state lock")
+            .prefixes
+            .insert(key.clone(), stat);
+
+        planner.finish_inflight(&key, false);
+
+        let state = planner.state.lock().expect("planner state lock");
+        let stat = &state.prefixes[&key];
+        assert_eq!(stat.state, PrefixOffloadState::CpuOnly);
+        assert!(stat.visibility_wait_started.is_none());
+    }
+
+    #[tokio::test]
+    async fn visibility_timeout_allows_a_lost_event_to_retry() {
+        let mut planner = test_planner();
+        planner.config.visibility_timeout = Duration::ZERO;
+        let planner = Arc::new(planner);
+        let key = PrefixKey { hashes: vec![9] };
+        let mut stat = prefix_stat(0, HashMap::new(), PrefixOffloadState::AwaitingVisibility);
+        stat.visibility_wait_started = Some(Instant::now());
+        planner
+            .state
+            .lock()
+            .expect("planner state lock")
+            .prefixes
+            .insert(key.clone(), stat);
+
+        planner.plan_once().await;
+
+        let state = planner.state.lock().expect("planner state lock");
+        let stat = &state.prefixes[&key];
+        assert_eq!(stat.state, PrefixOffloadState::CpuOnly);
+        assert!(stat.visibility_wait_started.is_none());
+    }
+
+    #[test]
+    fn candidate_score_requires_frequency_and_skew_and_uses_product_priority() {
+        let best = WorkerWithDpRank::from_worker_id(1);
+        let second = WorkerWithDpRank::from_worker_id(2);
+        let stat = prefix_stat(
+            10,
+            HashMap::from([(best, 1.0), (second, 0.2)]),
+            PrefixOffloadState::CpuOnly,
+        );
+        let score = score_candidate(&stat, 3, 0.5).expect("eligible candidate");
+        assert_eq!(score.source_worker, best);
+        assert!((score.skew - 0.8).abs() < f64::EPSILON);
+        assert!((score.priority - 8.0).abs() < f64::EPSILON);
+
+        assert!(
+            score_candidate(
+                &prefix_stat(2, stat.cpu_coverage.clone(), stat.state),
+                3,
+                0.5
+            )
+            .is_none()
+        );
+        assert!(
+            score_candidate(
+                &prefix_stat(
+                    10,
+                    HashMap::from([(best, 1.0), (second, 0.8)]),
+                    PrefixOffloadState::CpuOnly,
+                ),
+                3,
+                0.5,
+            )
+            .is_none()
+        );
+        assert!(
+            score_candidate(
+                &prefix_stat(
+                    10,
+                    HashMap::from([(best, 1.0), (second, 0.2)]),
+                    PrefixOffloadState::CpuAndCxl,
+                ),
+                3,
+                0.5,
+            )
+            .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn serving_pressure_defers_candidate_before_copy() {
+        let planner = Arc::new(test_planner());
+        let worker = WorkerWithDpRank::from_worker_id(3);
+        let key = PrefixKey { hashes: vec![42] };
+        let stat = prefix_stat(
+            3,
+            HashMap::from([(worker, 1.0)]),
+            PrefixOffloadState::CpuOnly,
+        );
+        {
+            let mut state = planner.state.lock().expect("planner state lock");
+            state.serving_decode_blocks = 9;
+            state.prefixes.insert(key.clone(), stat);
+        }
+
+        planner.plan_once().await;
+
+        let state = planner.state.lock().expect("planner state lock");
+        assert_eq!(state.prefixes[&key].state, PrefixOffloadState::CpuOnly);
     }
 }

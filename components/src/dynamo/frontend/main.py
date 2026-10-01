@@ -213,8 +213,17 @@ def parse_args():
         "--background-offload-hot-request-threshold",
         type=int,
         default=int(
-            os.environ.get("DYN_BACKGROUND_OFFLOAD_HOT_REQUEST_THRESHOLD", "5")
+            os.environ.get("DYN_BACKGROUND_OFFLOAD_HOT_REQUEST_THRESHOLD", "3")
         ),
+        help="Minimum repeated requests in the recent window before locality-skew selection.",
+    )
+    parser.add_argument(
+        "--background-offload-skew-threshold",
+        type=float,
+        default=float(
+            os.environ.get("DYN_BACKGROUND_OFFLOAD_SKEW_THRESHOLD", "0.5")
+        ),
+        help="Minimum CPU coverage skew (best worker minus second-best worker) for a candidate.",
     )
     parser.add_argument(
         "--background-offload-owner-load-threshold",
@@ -222,22 +231,31 @@ def parse_args():
         default=int(
             os.environ.get("DYN_BACKGROUND_OFFLOAD_OWNER_LOAD_THRESHOLD", "10")
         ),
+        help="Threshold for the separate lower-load routing override; not candidate selection.",
     )
     parser.add_argument(
+        "--background-offload-max-per-round",
         "--background-offload-top-k",
+        dest="background_offload_max_per_round",
         type=int,
-        default=int(os.environ.get("DYN_BACKGROUND_OFFLOAD_TOP_K", "100")),
+        default=int(
+            os.environ.get(
+                "DYN_BACKGROUND_OFFLOAD_MAX_PER_ROUND",
+                os.environ.get("DYN_BACKGROUND_OFFLOAD_TOP_K", "2"),
+            )
+        ),
+        help="Maximum number of locality-skew candidates dispatched per planner round.",
     )
     parser.add_argument(
         "--background-offload-max-chunks",
         type=int,
-        default=int(os.environ.get("DYN_BACKGROUND_OFFLOAD_MAX_CHUNKS", "8")),
+        default=int(os.environ.get("DYN_BACKGROUND_OFFLOAD_MAX_CHUNKS", "16")),
     )
     parser.add_argument(
         "--background-offload-max-inflight",
         type=int,
-        default=int(os.environ.get("DYN_BACKGROUND_OFFLOAD_MAX_INFLIGHT", "1")),
-        help="Legacy setting retained for compatibility; automatic offload is always single-concurrent.",
+        default=int(os.environ.get("DYN_BACKGROUND_OFFLOAD_MAX_INFLIGHT", "2")),
+        help="Maximum concurrent candidate copies; CXL serving-priority admission remains non-blocking.",
     )
     parser.add_argument(
         "--background-offload-max-active-decode-blocks",
@@ -275,6 +293,17 @@ def parse_args():
         "--background-offload-cooldown-secs",
         type=int,
         default=int(os.environ.get("DYN_BACKGROUND_OFFLOAD_COOLDOWN_SECS", "30")),
+    )
+    parser.add_argument(
+        "--background-offload-visibility-timeout-ms",
+        type=int,
+        default=int(
+            os.environ.get("DYN_BACKGROUND_OFFLOAD_VISIBILITY_TIMEOUT_MS", "30000")
+        ),
+        help=(
+            "Suppress a globally committed prefix while waiting for its CXL event; "
+            "retry after this timeout if visibility never arrives."
+        ),
     )
     parser.add_argument(
         "--lmcache-controller-endpoint",
@@ -505,8 +534,10 @@ async def async_main():
         "DYN_BACKGROUND_OFFLOAD_INTERVAL_MS": flags.background_offload_interval_ms,
         "DYN_BACKGROUND_OFFLOAD_WINDOW_MS": flags.background_offload_window_ms,
         "DYN_BACKGROUND_OFFLOAD_HOT_REQUEST_THRESHOLD": flags.background_offload_hot_request_threshold,
+        "DYN_BACKGROUND_OFFLOAD_SKEW_THRESHOLD": flags.background_offload_skew_threshold,
         "DYN_BACKGROUND_OFFLOAD_OWNER_LOAD_THRESHOLD": flags.background_offload_owner_load_threshold,
-        "DYN_BACKGROUND_OFFLOAD_TOP_K": flags.background_offload_top_k,
+        "DYN_BACKGROUND_OFFLOAD_MAX_PER_ROUND": flags.background_offload_max_per_round,
+        "DYN_BACKGROUND_OFFLOAD_TOP_K": flags.background_offload_max_per_round,
         "DYN_BACKGROUND_OFFLOAD_MAX_CHUNKS": flags.background_offload_max_chunks,
         "DYN_BACKGROUND_OFFLOAD_MAX_INFLIGHT": flags.background_offload_max_inflight,
         "DYN_BACKGROUND_OFFLOAD_MAX_ACTIVE_DECODE_BLOCKS": flags.background_offload_max_active_decode_blocks,
@@ -514,6 +545,9 @@ async def async_main():
         "DYN_BACKGROUND_OFFLOAD_BYTES_PER_SEC": flags.background_offload_bytes_per_sec,
         "DYN_BACKGROUND_OFFLOAD_CHUNK_BYTES": flags.background_offload_chunk_bytes,
         "DYN_BACKGROUND_OFFLOAD_COOLDOWN_SECS": flags.background_offload_cooldown_secs,
+        "DYN_BACKGROUND_OFFLOAD_VISIBILITY_TIMEOUT_MS": (
+            flags.background_offload_visibility_timeout_ms
+        ),
         "DYN_LMCACHE_CONTROLLER_ENDPOINT": flags.lmcache_controller_endpoint,
         "DYN_BACKGROUND_OFFLOAD_INSTANCE_MAP": flags.background_offload_instance_map,
         "DYN_BACKGROUND_OFFLOAD_INSTANCE_TEMPLATE": flags.background_offload_instance_template,
@@ -572,7 +606,7 @@ async def async_main():
             offload_window_ms=flags.background_offload_window_ms,
             offload_hot_request_threshold=flags.background_offload_hot_request_threshold,
             offload_owner_load_threshold=flags.background_offload_owner_load_threshold,
-            offload_top_k=flags.background_offload_top_k,
+            offload_top_k=flags.background_offload_max_per_round,
             offload_max_chunks=flags.background_offload_max_chunks,
             offload_max_inflight=flags.background_offload_max_inflight,
             offload_cooldown_secs=flags.background_offload_cooldown_secs,

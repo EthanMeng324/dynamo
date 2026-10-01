@@ -47,6 +47,35 @@ pub struct RoutingHints {
     /// Used as a hint for routing decisions to estimate resource requirements.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_output_tokens: Option<u32>,
+
+    /// A bounded, router-generated CXL prefetch hint for this request.
+    ///
+    /// The hint is carried with the selected request instead of being sent
+    /// over a separate worker control channel.  The selected worker remains
+    /// responsible for validating the hint and deciding whether to admit the
+    /// promotion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cxl_prefetch_hint: Option<CxlPrefetchHint>,
+}
+
+/// Request-scoped CXL prefetch metadata produced after the final worker route
+/// is selected.  It contains only bounded logical block positions; LMCache
+/// reconstructs the worker-local cache keys from the request lookup.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct CxlPrefetchHint {
+    /// Logical chunk/block positions that were observed as CXL-only at route
+    /// time.  Positions are relative to the beginning of the prompt.
+    #[serde(default)]
+    pub candidate_block_indices: Vec<u32>,
+
+    /// Maximum number of chunks the worker may admit in one promotion batch.
+    /// The full bounded candidate list may be submitted in multiple batches.
+    #[serde(default)]
+    pub max_chunks: u32,
+
+    /// Unix timestamp captured when the router made the final route choice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_decided_unix_ns: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]

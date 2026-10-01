@@ -177,8 +177,8 @@ pub(crate) struct WorkerBlockInfo {
 ///
 /// Aggregate tier scores are sufficient for normal routing, but they lose the
 /// distinction between a block that is CXL-only and a block that is already
-/// present in the selected worker's LocalCPU/GPU cache.  Waiting-route
-/// lookahead uses this bounded metadata to avoid issuing a hint for the latter
+/// present in the selected worker's LocalCPU/GPU cache.  Route-time hint
+/// evaluation uses this bounded metadata to avoid issuing a hint for the latter
 /// case.  The local block hash is the router-side identity only; LMCache still
 /// receives token IDs and derives its own CacheEngineKey.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -199,14 +199,14 @@ pub struct BlockResidencyMetadata {
 impl BlockResidencyMetadata {
     /// A block that can benefit from a CXL-to-LocalCPU promotion on this
     /// worker.  GPU/CPU residency and an existing speculative copy all make a
-    /// new waiting-route hint redundant.
+    /// new route-time hint redundant.
     pub fn cxl_only(&self) -> bool {
         self.cxl && !self.gpu && !self.cpu && !self.prefetch_inflight
     }
 }
 
 /// Keep query metadata bounded independently of prompt length.  The
-/// waiting-route client currently admits at most 8 chunks by default, so this
+/// route-time client currently admits at most 8 chunks by default, so this
 /// leaves room for configured values while preventing a long prompt from
 /// multiplying worker-by-block metadata without a bound.
 const MAX_BLOCK_RESIDENCY_METADATA: usize = 64;
@@ -1146,8 +1146,8 @@ pub struct OverlapScores {
     /// Bounded per-block tier metadata for the matched request prefix.
     ///
     /// This is intentionally separate from the aggregate score maps: a
-    /// waiting-route hint needs to know which exact blocks are CXL-only on the
-    /// predicted worker, rather than treating every CXL-visible block as a
+    /// route-time hint needs to know which exact blocks are CXL-only on the
+    /// selected worker, rather than treating every CXL-visible block as a
     /// promotion candidate.
     #[serde(default)]
     pub block_residency: HashMap<WorkerWithDpRank, Vec<BlockResidencyMetadata>>,
@@ -1221,7 +1221,7 @@ impl OverlapScores {
     ///   When true (kv-strata), bucket matches into disjoint GPU/CPU/CXL
     ///   categories so the scheduler can apply per-tier weights.
     /// Update aggregate scores and, when a request position is supplied,
-    /// retain bounded per-block residency metadata for lookahead decisions.
+    /// retain bounded per-block residency metadata for route-time decisions.
     pub(crate) fn update_scores_at<'a, I>(
         &mut self,
         worker_blocks: I,
