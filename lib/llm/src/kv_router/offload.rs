@@ -6,7 +6,8 @@
 //! Request handling only records observations.  A bounded background task
 //! wakes every few seconds, ranks repeated prefixes by CPU-locality skew, and
 //! sends a MessagePack
-//! `OffloadMsg` over LMCache's existing ZMQ REQ/REP controller endpoint.  The
+//! `OffloadMsg` over LMCache's existing ZMQ REQ/ROUTER-compatible controller
+//! endpoint.  The
 //! planner deliberately does not mutate Dynamo residency: only the normal CXL
 //! `BlockStored` event can make a copy routable.
 
@@ -44,6 +45,9 @@ struct PlannerConfig {
     /// Bound concurrent background operations so a planner round cannot
     /// create an unbounded burst of CXL traffic.
     max_inflight: usize,
+    /// Number of independent controller REQ sockets used by the opt-in
+    /// task-parallel path.  One preserves the legacy serialized RPC path.
+    rpc_parallelism: usize,
     /// Do not admit background copies while serving pressure is above these
     /// thresholds.  The values are snapshots supplied by the scheduler.
     max_serving_decode_blocks: u64,
@@ -54,6 +58,9 @@ struct PlannerConfig {
     /// Conservative estimate used to reserve a bounded per-operation budget.
     chunk_bytes: u64,
     cooldown: Duration,
+    /// Suppress a globally committed prefix while the event-backed index
+    /// catches up. A timeout permits recovery when an event is lost.
+    visibility_timeout: Duration,
     endpoint: Option<String>,
     instance_template: Option<String>,
     instance_map: HashMap<u64, String>,
@@ -77,6 +84,9 @@ impl PlannerConfig {
         )
         .max(1)
         .min(max_offloads_per_round);
+        let rpc_parallelism = env_usize("DYN_BACKGROUND_OFFLOAD_RPC_PARALLELISM", 1)
+            .max(1)
+            .min(max_inflight);
         Self {
             enabled: env_bool(
                 "DYN_BACKGROUND_OFFLOAD_ENABLED",
@@ -109,6 +119,7 @@ impl PlannerConfig {
             )
             .max(1),
             max_inflight,
+            rpc_parallelism,
             max_serving_decode_blocks: env_u64(
                 "DYN_BACKGROUND_OFFLOAD_MAX_ACTIVE_DECODE_BLOCKS",
                 16,
@@ -123,6 +134,9 @@ impl PlannerConfig {
                 "DYN_BACKGROUND_OFFLOAD_COOLDOWN_SECS",
                 config.offload_cooldown_secs,
             )),
+            visibility_timeout: Duration::from_millis(
+                env_u64("DYN_BACKGROUND_OFFLOAD_VISIBILITY_TIMEOUT_MS", 30_000).max(1),
+            ),
             endpoint: env::var("DYN_LMCACHE_CONTROLLER_ENDPOINT").ok(),
             instance_template: env::var("DYN_BACKGROUND_OFFLOAD_INSTANCE_TEMPLATE").ok(),
             instance_map: parse_instance_map(
@@ -190,6 +204,9 @@ enum PrefixOffloadState {
     CpuOnly,
     /// A copy operation has been dispatched and has not completed locally.
     Copying,
+    /// The controller completed the global commit, but the normal CXL event
+    /// has not yet made the complete prefix visible in the router index.
+    AwaitingVisibility,
     /// The prefix is fully visible in CXL according to the latest index view.
     CpuAndCxl,
 }
@@ -313,6 +330,7 @@ struct PrefixStat {
     window_start: Instant,
     last_seen: Instant,
     last_offload: Option<Instant>,
+    visibility_wait_started: Option<Instant>,
 }
 
 #[derive(Debug, Default)]
@@ -392,6 +410,9 @@ enum OffloadRequest {
         copy: bool,
         max_chunks: usize,
         max_bytes: u64,
+        /// Explicitly asks the LMCache controller to dispatch this task
+        /// asynchronously.  The default remains false for compatibility.
+        parallel: bool,
     },
 }
 
@@ -429,7 +450,11 @@ struct OffloadRpcResult {
 struct LmcacheOffloadClient {
     endpoint: String,
     timeout: Duration,
+    /// The compatibility path owns one persistent REQ socket and serializes
+    /// send/recv.  Parallel mode uses one short-lived REQ per operation.
+    rpc_parallelism: usize,
     socket: AsyncMutex<Option<ReqSocket>>,
+    parallel_slots: Arc<Semaphore>,
 }
 
 impl std::fmt::Debug for LmcacheOffloadClient {
@@ -438,33 +463,24 @@ impl std::fmt::Debug for LmcacheOffloadClient {
             .debug_struct("LmcacheOffloadClient")
             .field("endpoint", &self.endpoint)
             .field("timeout", &self.timeout)
+            .field("rpc_parallelism", &self.rpc_parallelism)
             .finish_non_exhaustive()
     }
 }
 
 impl LmcacheOffloadClient {
-    fn new(endpoint: String, timeout: Duration) -> Self {
+    fn new(endpoint: String, timeout: Duration, rpc_parallelism: usize) -> Self {
+        let rpc_parallelism = rpc_parallelism.max(1);
         Self {
             endpoint,
             timeout,
+            rpc_parallelism,
             socket: AsyncMutex::new(None),
+            parallel_slots: Arc::new(Semaphore::new(rpc_parallelism)),
         }
     }
 
-    async fn send(&self, request: OffloadRequest) -> Result<OffloadRpcResult> {
-        let payload = to_vec_named(&request).context("encode LMCache OffloadMsg")?;
-        let mut socket_guard = self.socket.lock().await;
-        if socket_guard.is_none() {
-            let mut socket = ReqSocket::new();
-            socket
-                .connect(&self.endpoint)
-                .await
-                .with_context(|| format!("connect LMCache controller {}", self.endpoint))?;
-            *socket_guard = Some(socket);
-        }
-        let socket = socket_guard
-            .as_mut()
-            .ok_or_else(|| anyhow!("LMCache REQ socket was not initialized"))?;
+    async fn exchange(&self, socket: &mut ReqSocket, payload: Vec<u8>) -> Result<OffloadRpcResult> {
         let request_result = tokio::time::timeout(self.timeout, async {
             socket
                 .send(ZmqMessage::from(Bytes::from(payload)))
@@ -528,21 +544,47 @@ impl LmcacheOffloadClient {
         })
         .await;
         match request_result {
-            Ok(Ok(success)) => Ok(success),
-            Ok(Err(error)) => {
-                // Send/receive/decode failures also leave a REQ socket in an
-                // unknown state.  Reconnect on the next bounded attempt.
-                *socket_guard = None;
-                Err(error)
-            }
-            Err(timeout_error) => {
-                // A timed-out REQ socket cannot safely accept a new request
-                // until its outstanding receive is consumed. Drop it and
-                // reconnect on the next planner attempt.
-                *socket_guard = None;
-                Err(timeout_error.into())
-            }
+            Ok(result) => result,
+            Err(timeout_error) => Err(timeout_error.into()),
         }
+    }
+
+    async fn send(&self, request: OffloadRequest) -> Result<OffloadRpcResult> {
+        let payload = to_vec_named(&request).context("encode LMCache OffloadMsg")?;
+        if self.rpc_parallelism > 1 {
+            let _permit = self
+                .parallel_slots
+                .acquire()
+                .await
+                .context("acquire LMCache offload RPC slot")?;
+            let mut socket = ReqSocket::new();
+            socket
+                .connect(&self.endpoint)
+                .await
+                .with_context(|| format!("connect LMCache controller {}", self.endpoint))?;
+            // A fresh REQ has no poisoned state to carry into the next task.
+            return self.exchange(&mut socket, payload).await;
+        }
+
+        let mut socket_guard = self.socket.lock().await;
+        if socket_guard.is_none() {
+            let mut socket = ReqSocket::new();
+            socket
+                .connect(&self.endpoint)
+                .await
+                .with_context(|| format!("connect LMCache controller {}", self.endpoint))?;
+            *socket_guard = Some(socket);
+        }
+        let socket = socket_guard
+            .as_mut()
+            .ok_or_else(|| anyhow!("LMCache REQ socket was not initialized"))?;
+        let result = self.exchange(socket, payload).await;
+        if result.is_err() {
+            // Send/receive/decode failures leave a REQ socket in an unknown
+            // state.  Reconnect on the next bounded attempt.
+            *socket_guard = None;
+        }
+        result
     }
 }
 
@@ -579,10 +621,13 @@ impl BackgroundOffloadPlanner {
             );
             return None;
         }
-        let client = config
-            .endpoint
-            .clone()
-            .map(|endpoint| Arc::new(LmcacheOffloadClient::new(endpoint, config.timeout)));
+        let client = config.endpoint.clone().map(|endpoint| {
+            Arc::new(LmcacheOffloadClient::new(
+                endpoint,
+                config.timeout,
+                config.rpc_parallelism,
+            ))
+        });
         let planner = Arc::new(Self {
             inflight: Arc::new(Semaphore::new(config.max_inflight)),
             byte_limiter: Mutex::new(ByteRateLimiter::new(
@@ -600,6 +645,7 @@ impl BackgroundOffloadPlanner {
             skew_threshold = planner.config.skew_threshold,
             max_offloads_per_round = planner.config.max_offloads_per_round,
             max_inflight = planner.config.max_inflight,
+            rpc_parallelism = planner.config.rpc_parallelism,
             max_active_decode_blocks = planner.config.max_serving_decode_blocks,
             max_pending_prefill_tokens = planner.config.max_serving_prefill_tokens,
             bytes_per_sec = planner.config.bytes_per_sec,
@@ -670,6 +716,7 @@ impl BackgroundOffloadPlanner {
             window_start: now,
             last_seen: now,
             last_offload: None,
+            visibility_wait_started: None,
         });
         if now.duration_since(stat.window_start) > self.config.window {
             stat.recent_requests = 0;
@@ -680,13 +727,15 @@ impl BackgroundOffloadPlanner {
         // Keep the latest CPU coverage rather than averaging historical
         // observations: CPU residency changes with eviction and new writes.
         stat.cpu_coverage = current_cpu_coverage;
-        // Do not overwrite Copying until event-backed CXL visibility is
-        // confirmed by a later route observation.
-        if stat.state == PrefixOffloadState::Copying {
-            // Keep a successful operation suppressed until the normal CXL
-            // event/index path confirms that the complete prefix is visible.
+        // Do not overwrite an in-flight or committed operation until
+        // event-backed CXL visibility is confirmed by a route observation.
+        if matches!(
+            stat.state,
+            PrefixOffloadState::Copying | PrefixOffloadState::AwaitingVisibility
+        ) {
             if cxl_ready {
                 stat.state = PrefixOffloadState::CpuAndCxl;
+                stat.visibility_wait_started = None;
             }
         } else {
             stat.state = if cxl_ready {
@@ -694,6 +743,7 @@ impl BackgroundOffloadPlanner {
             } else {
                 PrefixOffloadState::CpuOnly
             };
+            stat.visibility_wait_started = None;
         }
         stat.last_seen = now;
     }
@@ -738,6 +788,24 @@ impl BackgroundOffloadPlanner {
                     stat.recent_requests = 0;
                     stat.window_start = now;
                     continue;
+                }
+                if stat.state == PrefixOffloadState::AwaitingVisibility {
+                    let visibility_timed_out = stat
+                        .visibility_wait_started
+                        .map(|started| {
+                            now.duration_since(started) >= self.config.visibility_timeout
+                        })
+                        .unwrap_or(true);
+                    if !visibility_timed_out {
+                        continue;
+                    }
+                    tracing::warn!(
+                        prefix_blocks = key.hashes.len(),
+                        timeout_ms = self.config.visibility_timeout.as_millis(),
+                        "CXL offload visibility confirmation timed out; allowing retry"
+                    );
+                    stat.state = PrefixOffloadState::CpuOnly;
+                    stat.visibility_wait_started = None;
                 }
                 let cooldown_done = stat
                     .last_offload
@@ -804,6 +872,7 @@ impl BackgroundOffloadPlanner {
                     }
                     stat.state = PrefixOffloadState::Copying;
                     stat.last_offload = Some(now);
+                    stat.visibility_wait_started = None;
                     Some(true)
                 })
                 .unwrap_or(false);
@@ -824,12 +893,18 @@ impl BackgroundOffloadPlanner {
         }
     }
 
-    fn clear_inflight(&self, key: &PrefixKey) {
+    fn finish_inflight(&self, key: &PrefixKey, globally_committed: bool) {
         if let Ok(mut state) = self.state.lock()
             && let Some(stat) = state.prefixes.get_mut(key)
         {
             if stat.state == PrefixOffloadState::Copying {
-                stat.state = PrefixOffloadState::CpuOnly;
+                if globally_committed {
+                    stat.state = PrefixOffloadState::AwaitingVisibility;
+                    stat.visibility_wait_started = Some(Instant::now());
+                } else {
+                    stat.state = PrefixOffloadState::CpuOnly;
+                    stat.visibility_wait_started = None;
+                }
             }
         }
     }
@@ -878,6 +953,7 @@ impl BackgroundOffloadPlanner {
                             copy: true,
                             max_chunks: key.hashes.len().min(self.config.max_chunks),
                             max_bytes: reserved_bytes,
+                            parallel: self.config.rpc_parallelism > 1,
                         })
                         .await
                 }
@@ -900,18 +976,16 @@ impl BackgroundOffloadPlanner {
                     "Background CXL offload completed without CXL_READY success"
                 );
             }
-            // The RPC result only describes rank-local writes. CXL
-            // routability is still determined by the normal event/index path;
-            // a later observation will move the prefix to CpuAndCxl when the
-            // complete prefix is visible. Release the execution state here so
-            // a lost event cannot strand the prefix forever; last_offload keeps
-            // retries behind the cooldown.
-            self.clear_inflight(&key);
+            // Controller success means every registered rank completed the
+            // global CXL commit. Keep this prefix suppressed while the normal
+            // event/index path catches up; only that path makes it routable.
+            // The visibility timeout permits retry if an event is lost.
+            self.finish_inflight(&key, rpc_result.success);
         } else {
             if let Ok(mut limiter) = self.byte_limiter.lock() {
                 limiter.refund(reserved_bytes, 0);
             }
-            self.clear_inflight(&key);
+            self.finish_inflight(&key, false);
         }
     }
 
@@ -959,11 +1033,13 @@ mod tests {
             max_offloads_per_round: 2,
             max_chunks: 16,
             max_inflight: 2,
+            rpc_parallelism: 1,
             max_serving_decode_blocks: 8,
             max_serving_prefill_tokens: 0,
             bytes_per_sec: 1024,
             chunk_bytes: 1024,
             cooldown: Duration::from_secs(30),
+            visibility_timeout: Duration::from_secs(30),
             endpoint: None,
             instance_template: None,
             instance_map: HashMap::new(),
@@ -1031,6 +1107,7 @@ mod tests {
             window_start: now,
             last_seen: now,
             last_offload: None,
+            visibility_wait_started: None,
         }
     }
 
@@ -1145,6 +1222,90 @@ mod tests {
         let state = planner.state.lock().expect("planner state lock");
         let stat = state.prefixes.values().next().expect("prefix stat");
         assert_eq!(stat.state, PrefixOffloadState::CpuAndCxl);
+    }
+
+    #[test]
+    fn successful_commit_waits_for_event_visibility_without_redispatching() {
+        let planner = test_planner();
+        let owner = WorkerWithDpRank::from_worker_id(13);
+        let tokens = [1, 2, 3, 4, 5, 6, 7, 8];
+        let mut overlaps = OverlapScores::new();
+        add_residency(&mut overlaps, owner, 2, 2, 0, false);
+        planner.observe(&tokens, 4, &overlaps, &HashMap::new(), &HashMap::new());
+        let key = {
+            let mut state = planner.state.lock().expect("planner state lock");
+            let key = state.prefixes.keys().next().expect("prefix key").clone();
+            state.prefixes.get_mut(&key).expect("prefix stat").state = PrefixOffloadState::Copying;
+            key
+        };
+
+        planner.finish_inflight(&key, true);
+        {
+            let state = planner.state.lock().expect("planner state lock");
+            let stat = &state.prefixes[&key];
+            assert_eq!(stat.state, PrefixOffloadState::AwaitingVisibility);
+            assert!(stat.visibility_wait_started.is_some());
+            assert!(score_candidate(stat, 1, 0.0).is_none());
+        }
+
+        // An observation whose index view still lacks CXL must preserve the
+        // suppression state rather than returning the prefix to CpuOnly.
+        planner.observe(&tokens, 4, &overlaps, &HashMap::new(), &HashMap::new());
+        assert_eq!(
+            planner.state.lock().expect("planner state lock").prefixes[&key].state,
+            PrefixOffloadState::AwaitingVisibility
+        );
+
+        add_residency(&mut overlaps, owner, 2, 2, 2, false);
+        planner.observe(&tokens, 4, &overlaps, &HashMap::new(), &HashMap::new());
+        let state = planner.state.lock().expect("planner state lock");
+        let stat = &state.prefixes[&key];
+        assert_eq!(stat.state, PrefixOffloadState::CpuAndCxl);
+        assert!(stat.visibility_wait_started.is_none());
+    }
+
+    #[test]
+    fn failed_commit_returns_prefix_to_cpu_only() {
+        let planner = test_planner();
+        let key = PrefixKey { hashes: vec![7] };
+        let mut stat = prefix_stat(3, HashMap::new(), PrefixOffloadState::Copying);
+        stat.visibility_wait_started = Some(Instant::now());
+        planner
+            .state
+            .lock()
+            .expect("planner state lock")
+            .prefixes
+            .insert(key.clone(), stat);
+
+        planner.finish_inflight(&key, false);
+
+        let state = planner.state.lock().expect("planner state lock");
+        let stat = &state.prefixes[&key];
+        assert_eq!(stat.state, PrefixOffloadState::CpuOnly);
+        assert!(stat.visibility_wait_started.is_none());
+    }
+
+    #[tokio::test]
+    async fn visibility_timeout_allows_a_lost_event_to_retry() {
+        let mut planner = test_planner();
+        planner.config.visibility_timeout = Duration::ZERO;
+        let planner = Arc::new(planner);
+        let key = PrefixKey { hashes: vec![9] };
+        let mut stat = prefix_stat(0, HashMap::new(), PrefixOffloadState::AwaitingVisibility);
+        stat.visibility_wait_started = Some(Instant::now());
+        planner
+            .state
+            .lock()
+            .expect("planner state lock")
+            .prefixes
+            .insert(key.clone(), stat);
+
+        planner.plan_once().await;
+
+        let state = planner.state.lock().expect("planner state lock");
+        let stat = &state.prefixes[&key];
+        assert_eq!(stat.state, PrefixOffloadState::CpuOnly);
+        assert!(stat.visibility_wait_started.is_none());
     }
 
     #[test]

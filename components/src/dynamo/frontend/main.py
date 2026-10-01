@@ -295,6 +295,17 @@ def parse_args():
         default=int(os.environ.get("DYN_BACKGROUND_OFFLOAD_COOLDOWN_SECS", "30")),
     )
     parser.add_argument(
+        "--background-offload-visibility-timeout-ms",
+        type=int,
+        default=int(
+            os.environ.get("DYN_BACKGROUND_OFFLOAD_VISIBILITY_TIMEOUT_MS", "30000")
+        ),
+        help=(
+            "Suppress a globally committed prefix while waiting for its CXL event; "
+            "retry after this timeout if visibility never arrives."
+        ),
+    )
+    parser.add_argument(
         "--lmcache-controller-endpoint",
         default=os.environ.get("DYN_LMCACHE_CONTROLLER_ENDPOINT"),
         help="LMCache controller ZMQ REQ/REP endpoint, e.g. tcp://controller:9000.",
@@ -534,6 +545,9 @@ async def async_main():
         "DYN_BACKGROUND_OFFLOAD_BYTES_PER_SEC": flags.background_offload_bytes_per_sec,
         "DYN_BACKGROUND_OFFLOAD_CHUNK_BYTES": flags.background_offload_chunk_bytes,
         "DYN_BACKGROUND_OFFLOAD_COOLDOWN_SECS": flags.background_offload_cooldown_secs,
+        "DYN_BACKGROUND_OFFLOAD_VISIBILITY_TIMEOUT_MS": (
+            flags.background_offload_visibility_timeout_ms
+        ),
         "DYN_LMCACHE_CONTROLLER_ENDPOINT": flags.lmcache_controller_endpoint,
         "DYN_BACKGROUND_OFFLOAD_INSTANCE_MAP": flags.background_offload_instance_map,
         "DYN_BACKGROUND_OFFLOAD_INSTANCE_TEMPLATE": flags.background_offload_instance_template,
